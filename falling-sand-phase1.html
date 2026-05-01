@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spark's Falling Sand — Phase 1</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 4px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 920px; justify-content: center; }
+.btn { padding: 4px 8px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; line-height: 1.2; transition: background 0.1s; }
+.btn.active { border-color: #fff; background: #3a3a5e; }
+.btn:hover { background: #3a3a5e; }
+.btn .key { font-size: 9px; color: #888; display: block; }
+.sep { width: 1px; height: 28px; background: #444; margin: 0 4px; }
+h1 { font-size: 14px; margin-bottom: 6px; color: #888; }
+.status { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #666; }
+.status .warn { color: #c44; }
+.info { margin-top: 4px; font-size: 10px; color: #555; max-width: 920px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>falling sand — phase 1: thermal model</h1>
+<div class="toolbar" id="toolbar"></div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span>
+  <span id="particles">0 particles</span>
+  <span id="brush-label">Brush: 3</span>
+  <span id="mode-label"></span>
+</div>
+<div class="info">Draw: click+drag · Brush: scroll · 1-9/Q/W/E/R/T: materials · 0: erase · V: thermal view · Space: pause · C: clear</div>
+
+<script>
+const W = 300, H = 200, SCALE = 3;
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, FIRE = 4, WOOD = 5, OIL = 6, GUNPOWDER = 7;
+const STEAM = 8, ACID = 9, LAVA = 10, ICE = 11, SMOKE = 12, PLANT = 13, SALT = 14, METAL = 15;
+
+const DENSITY =    [0, 4, 3, 8, 0, 5, 2, 4, 0, 3, 7, 3, 0, 5, 4, 9];
+const CONDUCT =    [0.02, 0.3, 0.6, 0.5, 0.1, 0.08, 0.12, 0.2, 0.04, 0.5, 0.8, 0.8, 0.02, 0.08, 0.3, 0.95];
+const ROOM_TEMP = 22;
+
+const grid = new Uint8Array(W * H);
+const temp = new Float32Array(W * H);
+const life = new Uint8Array(W * H);
+const updated = new Uint8Array(W * H);
+const imgData = ctx.createImageData(W, H);
+const pixels = new Uint32Array(imgData.data.buffer);
+const offscreen = new OffscreenCanvas(W, H);
+const octx = offscreen.getContext('2d');
+
+temp.fill(ROOM_TEMP);
+
+let material = SAND;
+let brushSize = 3;
+let mouseDown = false;
+let mouseX = 0, mouseY = 0;
+let paused = false;
+let showTemp = false;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let currentFps = 60;
+
+function idx(x, y) { return y * W + x; }
+function inBounds(x, y) { return x >= 0 && x < W && y >= 0 && y < H; }
+function get(x, y) { return inBounds(x, y) ? grid[idx(x, y)] : STONE; }
+function getTemp(x, y) { return inBounds(x, y) ? temp[idx(x, y)] : ROOM_TEMP; }
+
+function set(x, y, m, t) {
+  if (!inBounds(x, y)) return;
+  const i = idx(x, y);
+  grid[i] = m;
+  if (t !== undefined) temp[i] = t;
+}
+
+function swap(x1, y1, x2, y2) {
+  const i1 = idx(x1, y1), i2 = idx(x2, y2);
+  let t;
+  t = grid[i1]; grid[i1] = grid[i2]; grid[i2] = t;
+  t = life[i1]; life[i1] = life[i2]; life[i2] = t;
+  t = temp[i1]; temp[i1] = temp[i2]; temp[i2] = t;
+  updated[i2] = 1;
+}
+
+function isPowder(m) { return m === SAND || m === GUNPOWDER || m === SALT; }
+function isLiquid(m) { return m === WATER || m === OIL || m === ACID || m === LAVA; }
+function isGas(m) { return m === STEAM || m === SMOKE; }
+function isSolid(m) { return m === STONE || m === WOOD || m === ICE || m === PLANT || m === METAL; }
+
+function canDisplace(mover, target) {
+  if (target === EMPTY) return true;
+  if (isSolid(target)) return false;
+  if (isGas(mover)) return false;
+  return DENSITY[mover] > DENSITY[target];
+}
+
+// ==================== COLORS ====================
+
+function varyColor(base, amount) {
+  const v = (Math.random() - 0.5) * amount * 2;
+  return [
+    Math.max(0, Math.min(255, base[0] + v)),
+    Math.max(0, Math.min(255, base[1] + v)),
+    Math.max(0, Math.min(255, base[2] + v)),
+  ];
+}
+
+function matColor(mat) {
+  switch (mat) {
+    case SAND: return varyColor([210, 180, 100], 15);
+    case WATER: return varyColor([40, 80, 200], 20);
+    case STONE: return varyColor([120, 120, 130], 10);
+    case FIRE: return [255, 80 + Math.random() * 120 | 0, Math.random() * 40 | 0];
+    case WOOD: return varyColor([100, 65, 30], 10);
+    case OIL: return varyColor([60, 40, 70], 8);
+    case GUNPOWDER: return varyColor([80, 80, 80], 8);
+    case STEAM: return [180 + Math.random() * 40 | 0, 180 + Math.random() * 40 | 0, 210 + Math.random() * 30 | 0];
+    case ACID: return varyColor([30, 220, 50], 25);
+    case LAVA:
+      if (Math.random() > 0.7) return [255, 180 + Math.random() * 75 | 0, 30 + Math.random() * 60 | 0];
+      return varyColor([200, 60, 10], 20);
+    case ICE: return varyColor([180, 215, 250], 8);
+    case SMOKE: return [70 + Math.random() * 30 | 0, 70 + Math.random() * 30 | 0, 75 + Math.random() * 30 | 0];
+    case PLANT: return varyColor([30, 140 + Math.random() * 40 | 0, 35], 12);
+    case SALT: return varyColor([230, 230, 240], 8);
+    case METAL: return varyColor([170, 175, 182], 6);
+    default: return [26, 26, 46];
+  }
+}
+
+function thermalTint(r, g, b, t) {
+  if (t > 60) {
+    const f = Math.min(1, (t - 60) / 400);
+    r = Math.min(255, r + f * 120);
+    g = Math.min(255, g + f * 25);
+    b = Math.max(0, b - f * 60);
+  } else if (t < 5) {
+    const f = Math.min(1, (5 - t) / 30);
+    r = Math.max(0, r - f * 40);
+    g = Math.min(255, g + f * 15);
+    b = Math.min(255, b + f * 80);
+  }
+  return [r | 0, g | 0, b | 0];
+}
+
+function tempHeatmap(t) {
+  if (t < 0) {
+    const f = Math.min(1, -t / 30);
+    return [20, 40 + f * 80 | 0, 100 + f * 155 | 0];
+  }
+  if (t < 25) return [30, 30, 50];
+  const hot = t - 25;
+  if (hot < 75) { const f = hot / 75; return [f * 200 | 0, f * 150 | 0, 20]; }
+  if (hot < 275) { const f = (hot - 75) / 200; return [200 + f * 55 | 0, 150 - f * 100 | 0, 0]; }
+  if (hot < 675) { const f = (hot - 275) / 400; return [255, 50 + f * 130 | 0, f * 60 | 0]; }
+  return [255, 200, 100];
+}
+
+// ==================== THERMAL ====================
+
+const NEIGHBOR4 = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+
+function simulateThermal() {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+
+      if (mat === EMPTY) {
+        if (Math.abs(temp[i] - ROOM_TEMP) < 0.5) { temp[i] = ROOM_TEMP; continue; }
+        temp[i] += (ROOM_TEMP - temp[i]) * 0.1;
+        continue;
+      }
+
+      if (mat === FIRE) temp[i] = Math.max(temp[i], 400 + Math.random() * 200);
+      else if (mat === LAVA) temp[i] = Math.max(temp[i], 700 + Math.random() * 150);
+      else if (mat === ICE) temp[i] = Math.min(temp[i], -5);
+
+      const myCond = CONDUCT[mat];
+      let heatFlow = 0;
+      let neighbors = 0;
+
+      for (const [dx, dy] of NEIGHBOR4) {
+        const nx = x + dx, ny = y + dy;
+        if (!inBounds(nx, ny)) continue;
+        const ni = idx(nx, ny);
+        const avgCond = (myCond + CONDUCT[grid[ni]]) * 0.5;
+        heatFlow += (temp[ni] - temp[i]) * avgCond;
+        neighbors++;
+      }
+
+      if (neighbors > 0) temp[i] += heatFlow / neighbors * 0.15;
+      temp[i] += (ROOM_TEMP - temp[i]) * 0.001;
+      if (temp[i] < -50) temp[i] = -50;
+      if (temp[i] > 1200) temp[i] = 1200;
+    }
+  }
+}
+
+// ==================== TRANSITIONS ====================
+
+function explode(cx, cy, radius) {
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      if (dx * dx + dy * dy > radius * radius) continue;
+      const nx = cx + dx, ny = cy + dy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      const m = grid[ni];
+      if (m === GUNPOWDER) {
+        grid[ni] = FIRE; life[ni] = 0; temp[ni] = 600;
+      } else if (m !== STONE && m !== METAL) {
+        if (Math.random() < 0.5) {
+          grid[ni] = FIRE; life[ni] = 10;
+        }
+      }
+      temp[ni] = Math.max(temp[ni], 500 - (dx * dx + dy * dy) * 40);
+    }
+  }
+}
+
+function checkTransitions() {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+      const t = temp[i];
+
+      switch (mat) {
+        case WATER:
+          if (t >= 100) { grid[i] = STEAM; life[i] = 0; }
+          else if (t <= -2) { grid[i] = ICE; }
+          break;
+        case ICE:
+          if (t > 5) { grid[i] = WATER; }
+          break;
+        case STEAM:
+          if (t < 85) { grid[i] = WATER; life[i] = 0; }
+          break;
+        case LAVA:
+          if (t < 400) { grid[i] = STONE; temp[i] = 350; }
+          break;
+        case STONE:
+          if (t > 900 && Math.random() < 0.01) { grid[i] = LAVA; }
+          break;
+        case METAL:
+          if (t > 650 && Math.random() < 0.01) { grid[i] = LAVA; temp[i] = 700; }
+          break;
+        case WOOD:
+          if (t > 300) { grid[i] = FIRE; life[i] = 0; }
+          break;
+        case OIL:
+          if (t > 150) { grid[i] = FIRE; life[i] = 0; }
+          break;
+        case GUNPOWDER:
+          if (t > 100) {
+            grid[i] = FIRE; life[i] = 0; temp[i] = 600;
+            explode(x, y, 3);
+          }
+          break;
+        case PLANT:
+          if (t > 250) { grid[i] = FIRE; life[i] = 0; }
+          break;
+      }
+    }
+  }
+}
+
+// ==================== MATERIAL BEHAVIORS ====================
+
+function simPowder(x, y, mat) {
+  const below = get(x, y + 1);
+  if (canDisplace(mat, below)) {
+    swap(x, y, x, y + 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (canDisplace(mat, get(x + dir, y + 1))) swap(x, y, x + dir, y + 1);
+    else if (canDisplace(mat, get(x - dir, y + 1))) swap(x, y, x - dir, y + 1);
+  }
+
+  if (mat === SALT) {
+    for (const [dx, dy] of NEIGHBOR4) {
+      if (get(x + dx, y + dy) === WATER && Math.random() < 0.05) {
+        grid[idx(x, y)] = EMPTY;
+        temp[idx(x, y)] = ROOM_TEMP;
+        return;
+      }
+    }
+  }
+}
+
+function simLiquid(x, y, mat) {
+  const below = get(x, y + 1);
+  if (canDisplace(mat, below)) { swap(x, y, x, y + 1); return; }
+
+  const dir = Math.random() > 0.5 ? 1 : -1;
+  if (canDisplace(mat, get(x + dir, y + 1))) swap(x, y, x + dir, y + 1);
+  else if (canDisplace(mat, get(x - dir, y + 1))) swap(x, y, x - dir, y + 1);
+  else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+  else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+}
+
+function simAcid(x, y) {
+  const i = idx(x, y);
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const neighbor = get(nx, ny);
+    if (neighbor === EMPTY || neighbor === ACID || neighbor === STONE || neighbor === LAVA) continue;
+
+    if (neighbor === WATER) {
+      if (Math.random() < 0.08) {
+        grid[idx(nx, ny)] = EMPTY; temp[idx(nx, ny)] = ROOM_TEMP;
+        grid[i] = EMPTY; temp[i] = ROOM_TEMP;
+        return;
+      }
+      continue;
+    }
+
+    if (Math.random() < 0.03) {
+      grid[idx(nx, ny)] = EMPTY; temp[idx(nx, ny)] = ROOM_TEMP;
+      if (Math.random() < 0.4) {
+        grid[i] = Math.random() < 0.5 ? SMOKE : EMPTY;
+        life[i] = 0;
+        return;
+      }
+    }
+  }
+
+  const below = get(x, y + 1);
+  if (canDisplace(ACID, below)) { swap(x, y, x, y + 1); return; }
+  const dir = Math.random() > 0.5 ? 1 : -1;
+  if (get(x + dir, y + 1) === EMPTY) swap(x, y, x + dir, y + 1);
+  else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+  else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+}
+
+function simLava(x, y) {
+  const i = idx(x, y);
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const neighbor = get(nx, ny);
+    const ni = idx(nx, ny);
+
+    if (neighbor === WATER) {
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 110;
+      temp[i] -= 100;
+      if (temp[i] < 400) { grid[i] = STONE; temp[i] = 350; return; }
+    } else if (neighbor === ICE) {
+      grid[ni] = WATER; temp[ni] = 20;
+      temp[i] -= 50;
+    }
+  }
+
+  if (Math.random() < 0.3) return;
+
+  const below = get(x, y + 1);
+  if (canDisplace(LAVA, below)) { swap(x, y, x, y + 1); return; }
+
+  if (Math.random() < 0.3) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y + 1) === EMPTY) swap(x, y, x + dir, y + 1);
+    else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+    else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+  }
+}
+
+function simFire(x, y) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > 20 + Math.random() * 30) {
+    grid[i] = Math.random() < 0.4 ? SMOKE : EMPTY;
+    life[i] = 0;
+    return;
+  }
+
+  const dirs6 = [[0, -1], [0, 1], [-1, 0], [1, 0], [-1, -1], [1, -1]];
+  for (const [dx, dy] of dirs6) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+
+    if (neighbor === WATER) {
+      grid[i] = STEAM; life[i] = 0; temp[i] = 100;
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 100;
+      return;
+    }
+
+    if (dy === -1 && neighbor === EMPTY && Math.random() < 0.08) {
+      grid[ni] = SMOKE; life[ni] = 0;
+    }
+  }
+
+  if (Math.random() < 0.35 && get(x, y - 1) === EMPTY) {
+    swap(x, y, x, y - 1);
+  } else if (Math.random() < 0.15) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y - 1) === EMPTY) swap(x, y, x + dir, y - 1);
+  }
+}
+
+function simGas(x, y, mat, maxLife) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > maxLife + Math.random() * maxLife * 0.5) {
+    grid[i] = EMPTY; life[i] = 0;
+    return;
+  }
+
+  if (mat === STEAM && isLiquid(get(x, y - 1)) && Math.random() < 0.3) {
+    swap(x, y, x, y - 1);
+    return;
+  }
+
+  if (mat === SMOKE) {
+    for (const [dx, dy] of NEIGHBOR4) {
+      if (get(x + dx, y + dy) === WATER) {
+        grid[i] = EMPTY; life[i] = 0;
+        return;
+      }
+    }
+  }
+
+  if (get(x, y - 1) === EMPTY) {
+    if (Math.random() < 0.7) swap(x, y, x, y - 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y - 1) === EMPTY) swap(x, y, x + dir, y - 1);
+    else if (get(x + dir, y) === EMPTY && Math.random() < 0.4) swap(x, y, x + dir, y);
+    else if (get(x - dir, y) === EMPTY && Math.random() < 0.4) swap(x, y, x - dir, y);
+  }
+}
+
+function simPlant(x, y) {
+  let hasWater = false;
+  for (const [dx, dy] of NEIGHBOR4) {
+    if (get(x + dx, y + dy) === WATER) { hasWater = true; break; }
+  }
+
+  if (hasWater && Math.random() < 0.008) {
+    const growDirs = [[0, -1], [-1, -1], [1, -1], [-1, 0], [1, 0], [0, 1]];
+    for (const [dx, dy] of growDirs) {
+      const nx = x + dx, ny = y + dy;
+      if (inBounds(nx, ny) && get(nx, ny) === EMPTY) {
+        set(nx, ny, PLANT, temp[idx(x, y)]);
+        for (const [wx, wy] of NEIGHBOR4) {
+          if (get(x + wx, y + wy) === WATER && Math.random() < 0.3) {
+            set(x + wx, y + wy, EMPTY, ROOM_TEMP);
+            break;
+          }
+        }
+        return;
+      }
+    }
+  }
+}
+
+// ==================== MAIN SIMULATION ====================
+
+function simulate() {
+  updated.fill(0);
+  simulateThermal();
+  checkTransitions();
+
+  const leftToRight = Math.random() > 0.5;
+  for (let y = H - 1; y >= 0; y--) {
+    const startX = leftToRight ? 0 : W - 1;
+    const endX = leftToRight ? W : -1;
+    const stepX = leftToRight ? 1 : -1;
+
+    for (let x = startX; x !== endX; x += stepX) {
+      const i = idx(x, y);
+      if (updated[i]) continue;
+      const mat = grid[i];
+      if (mat === EMPTY) continue;
+
+      if (isPowder(mat)) simPowder(x, y, mat);
+      else if (mat === ACID) simAcid(x, y);
+      else if (mat === LAVA) simLava(x, y);
+      else if (isLiquid(mat)) simLiquid(x, y, mat);
+      else if (mat === FIRE) simFire(x, y);
+      else if (mat === STEAM) simGas(x, y, STEAM, 80);
+      else if (mat === SMOKE) simGas(x, y, SMOKE, 60);
+      else if (mat === PLANT) simPlant(x, y);
+    }
+  }
+}
+
+// ==================== RENDERING ====================
+
+function render() {
+  for (let i = 0; i < W * H; i++) {
+    let c;
+    if (showTemp) {
+      c = tempHeatmap(temp[i]);
+    } else {
+      c = matColor(grid[i]);
+      const mat = grid[i];
+      if (mat !== EMPTY && mat !== FIRE && mat !== LAVA) {
+        c = thermalTint(c[0], c[1], c[2], temp[i]);
+      }
+    }
+    pixels[i] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+  }
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+}
+
+// ==================== INPUT ====================
+
+function paint() {
+  const r = brushSize;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const px = mouseX + dx, py = mouseY + dy;
+      if (!inBounds(px, py)) continue;
+      const pi = idx(px, py);
+      if (material === EMPTY) {
+        grid[pi] = EMPTY; life[pi] = 0; temp[pi] = ROOM_TEMP;
+      } else if (grid[pi] === EMPTY) {
+        if (Math.random() < 0.7) {
+          grid[pi] = material; life[pi] = 0;
+          if (material === FIRE) temp[pi] = 500;
+          else if (material === LAVA) temp[pi] = 800;
+          else if (material === ICE) temp[pi] = -10;
+          else temp[pi] = ROOM_TEMP;
+        }
+      }
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  mouseDown = true;
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mouseup', () => mouseDown = false);
+canvas.addEventListener('mouseleave', () => mouseDown = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(20, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = `Brush: ${brushSize}`;
+}, { passive: false });
+
+const keyMap = {
+  '1': SAND, '2': WATER, '3': STONE, '4': FIRE, '5': WOOD,
+  '6': OIL, '7': GUNPOWDER, '8': ICE, '9': ACID, '0': EMPTY,
+  'q': LAVA, 'w': METAL, 'e': PLANT, 'r': SALT, 't': SMOKE
+};
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (keyMap[k] !== undefined) { material = keyMap[k]; updateActiveBtn(); }
+  if (k === 'c' && !e.ctrlKey) { grid.fill(0); life.fill(0); temp.fill(ROOM_TEMP); }
+  if (k === ' ') { e.preventDefault(); paused = !paused; updateModeLabel(); }
+  if (k === 'v') { showTemp = !showTemp; updateModeLabel(); }
+});
+
+function updateActiveBtn() {
+  document.querySelectorAll('.mat-btn').forEach(b => b.classList.remove('active'));
+  const t = document.querySelector(`[data-mat="${material}"]`);
+  if (t) t.classList.add('active');
+}
+
+function updateModeLabel() {
+  const p = [];
+  if (paused) p.push('PAUSED');
+  if (showTemp) p.push('THERMAL VIEW');
+  document.getElementById('mode-label').textContent = p.join(' · ');
+}
+
+// ==================== UI SETUP ====================
+
+const BTN_COLORS = {
+  [SAND]: '#d4b464', [WATER]: '#2850c8', [STONE]: '#787882', [FIRE]: '#ff6420',
+  [WOOD]: '#64411e', [OIL]: '#3c2846', [GUNPOWDER]: '#505050', [STEAM]: '#b4b4dc',
+  [ACID]: '#1edc32', [LAVA]: '#c83c0a', [ICE]: '#b4d6fa', [SMOKE]: '#5a5a5f',
+  [PLANT]: '#1ea028', [SALT]: '#dcdcf0', [METAL]: '#aaafb4', [EMPTY]: null,
+};
+
+const toolbar = document.getElementById('toolbar');
+const btnDefs = [
+  [SAND, 'Sand', '1'], [WATER, 'Water', '2'], [STONE, 'Stone', '3'],
+  [ICE, 'Ice', '8'], [SALT, 'Salt', 'R'], [WOOD, 'Wood', '5'],
+  [PLANT, 'Plant', 'E'], null,
+  [OIL, 'Oil', '6'], [GUNPOWDER, 'Pwdr', '7'], [METAL, 'Metal', 'W'],
+  [ACID, 'Acid', '9'], [LAVA, 'Lava', 'Q'], [FIRE, 'Fire', '4'],
+  [SMOKE, 'Smoke', 'T'], null,
+  [EMPTY, 'Erase', '0'],
+];
+
+btnDefs.forEach(def => {
+  if (def === null) {
+    const sep = document.createElement('div');
+    sep.className = 'sep';
+    toolbar.appendChild(sep);
+    return;
+  }
+  const [id, name, key] = def;
+  const btn = document.createElement('button');
+  btn.className = 'btn mat-btn' + (id === material ? ' active' : '');
+  btn.dataset.mat = id;
+  btn.innerHTML = `${name}<span class="key">${key}</span>`;
+  if (BTN_COLORS[id]) {
+    btn.style.borderBottomColor = BTN_COLORS[id];
+    btn.style.borderBottomWidth = '3px';
+  }
+  btn.addEventListener('click', () => { material = id; updateActiveBtn(); });
+  toolbar.appendChild(btn);
+});
+
+const clearBtn = document.createElement('button');
+clearBtn.className = 'btn';
+clearBtn.innerHTML = 'Clear<span class="key">C</span>';
+clearBtn.style.borderColor = '#833';
+clearBtn.addEventListener('click', () => { grid.fill(0); life.fill(0); temp.fill(ROOM_TEMP); });
+toolbar.appendChild(clearBtn);
+
+// ==================== GAME LOOP ====================
+
+function loop() {
+  if (mouseDown) paint();
+  if (!paused) simulate();
+  render();
+
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    currentFps = frameCount;
+    frameCount = 0;
+    lastFpsTime = now;
+    const fpsEl = document.getElementById('fps');
+    fpsEl.textContent = `${currentFps} fps`;
+    fpsEl.className = currentFps < 30 ? 'warn' : '';
+
+    let count = 0;
+    for (let i = 0; i < W * H; i++) { if (grid[i] !== EMPTY) count++; }
+    document.getElementById('particles').textContent = `${count} particles`;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>

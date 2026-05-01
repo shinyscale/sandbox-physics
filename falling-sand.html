@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spark's Falling Sand</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: monospace; color: #e0e0e0; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
+.btn { padding: 6px 14px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 4px; font-family: monospace; font-size: 13px; }
+.btn.active { border-color: #fff; background: #3a3a5e; }
+.btn:hover { background: #3a3a5e; }
+h1 { font-size: 16px; margin-bottom: 8px; color: #888; }
+.info { margin-top: 8px; font-size: 11px; color: #666; }
+#brush-label { font-size: 12px; color: #888; margin-left: 12px; }
+</style>
+</head>
+<body>
+<h1>falling sand — a sneak peek</h1>
+<div class="toolbar">
+  <button class="btn active" data-mat="sand">Sand</button>
+  <button class="btn" data-mat="water">Water</button>
+  <button class="btn" data-mat="stone">Stone</button>
+  <button class="btn" data-mat="fire">Fire</button>
+  <button class="btn" data-mat="wood">Wood</button>
+  <button class="btn" data-mat="oil">Oil</button>
+  <button class="btn" data-mat="gunpowder">Powder</button>
+  <button class="btn" data-mat="erase">Erase</button>
+  <button class="btn" data-mat="clear" style="margin-left:12px;border-color:#833;">Clear</button>
+  <span id="brush-label">Brush: 3</span>
+</div>
+<canvas id="c"></canvas>
+<div class="info">Click & drag to draw. Scroll to change brush size. Fire burns wood, oil, and powder. Water puts out fire.</div>
+
+<script>
+const W = 300, H = 200, SCALE = 3;
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, FIRE = 4, WOOD = 5, OIL = 6, GUNPOWDER = 7, STEAM = 8;
+
+const grid = new Uint8Array(W * H);
+const life = new Uint8Array(W * H); // for fire/steam lifetime
+const updated = new Uint8Array(W * H);
+const imgData = ctx.createImageData(W, H);
+const pixels = new Uint32Array(imgData.data.buffer);
+
+let material = SAND;
+let brushSize = 3;
+let mouseDown = false;
+let mouseX = 0, mouseY = 0;
+
+const COLORS = {
+  [EMPTY]: [26, 26, 46],
+  [SAND]: null, // varied
+  [WATER]: null,
+  [STONE]: null,
+  [FIRE]: null,
+  [WOOD]: null,
+  [OIL]: null,
+  [GUNPOWDER]: null,
+  [STEAM]: [200, 200, 220],
+};
+
+function randColor(base, vary) {
+  const v = (Math.random() - 0.5) * vary * 2;
+  return [
+    Math.max(0, Math.min(255, base[0] + v)),
+    Math.max(0, Math.min(255, base[1] + v)),
+    Math.max(0, Math.min(255, base[2] + v)),
+  ];
+}
+
+function matColor(mat) {
+  switch(mat) {
+    case SAND: return randColor([210, 180, 100], 15);
+    case WATER: return randColor([40, 80, 200], 20);
+    case STONE: return randColor([120, 120, 130], 10);
+    case FIRE: return [255, Math.random()*120+80|0, Math.random()*40|0];
+    case WOOD: return randColor([100, 65, 30], 10);
+    case OIL: return randColor([60, 40, 70], 8);
+    case GUNPOWDER: return randColor([80, 80, 80], 8);
+    case STEAM: return [180+Math.random()*40|0, 180+Math.random()*40|0, 210+Math.random()*30|0];
+    default: return COLORS[EMPTY];
+  }
+}
+
+function idx(x, y) { return y * W + x; }
+function get(x, y) { if (x < 0 || x >= W || y < 0 || y >= H) return STONE; return grid[idx(x,y)]; }
+function set(x, y, mat) { if (x < 0 || x >= W || y < 0 || y >= H) return; grid[idx(x,y)] = mat; }
+function swap(x1,y1,x2,y2) {
+  const i1 = idx(x1,y1), i2 = idx(x2,y2);
+  const t = grid[i1]; grid[i1] = grid[i2]; grid[i2] = t;
+  const tl = life[i1]; life[i1] = life[i2]; life[i2] = tl;
+  updated[i2] = 1;
+}
+
+function simulate() {
+  updated.fill(0);
+  // alternate scan direction each frame to reduce bias
+  const leftToRight = Math.random() > 0.5;
+
+  for (let y = H - 1; y >= 0; y--) {
+    const startX = leftToRight ? 0 : W - 1;
+    const endX = leftToRight ? W : -1;
+    const stepX = leftToRight ? 1 : -1;
+
+    for (let x = startX; x !== endX; x += stepX) {
+      const i = idx(x, y);
+      if (updated[i]) continue;
+      const mat = grid[i];
+      if (mat === EMPTY) continue;
+
+      if (mat === SAND || mat === GUNPOWDER) {
+        const below = get(x, y+1);
+        if (below === EMPTY || below === WATER || below === OIL) {
+          swap(x, y, x, y+1);
+        } else {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          const bl = get(x+dir, y+1);
+          const br = get(x-dir, y+1);
+          if (bl === EMPTY || bl === WATER || bl === OIL) {
+            swap(x, y, x+dir, y+1);
+          } else if (br === EMPTY || br === WATER || br === OIL) {
+            swap(x, y, x-dir, y+1);
+          }
+        }
+      }
+
+      else if (mat === WATER) {
+        const below = get(x, y+1);
+        if (below === EMPTY || below === OIL) {
+          swap(x, y, x, y+1);
+        } else {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          const bl = get(x+dir, y+1);
+          if (bl === EMPTY || bl === OIL) {
+            swap(x, y, x+dir, y+1);
+          } else if (get(x+dir, y) === EMPTY) {
+            swap(x, y, x+dir, y);
+          } else if (get(x-dir, y) === EMPTY) {
+            swap(x, y, x-dir, y);
+          }
+        }
+      }
+
+      else if (mat === OIL) {
+        const below = get(x, y+1);
+        if (below === EMPTY) {
+          swap(x, y, x, y+1);
+        } else {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          if (get(x+dir, y+1) === EMPTY) {
+            swap(x, y, x+dir, y+1);
+          } else if (get(x+dir, y) === EMPTY) {
+            swap(x, y, x+dir, y);
+          } else if (get(x-dir, y) === EMPTY) {
+            swap(x, y, x-dir, y);
+          }
+        }
+      }
+
+      else if (mat === FIRE) {
+        life[i]++;
+        if (life[i] > 20 + Math.random() * 30) {
+          // fire burns out
+          if (Math.random() < 0.3) {
+            grid[i] = STEAM; life[i] = 0;
+          } else {
+            grid[i] = EMPTY; life[i] = 0;
+          }
+          continue;
+        }
+        // spread
+        const dirs = [[0,-1],[0,1],[-1,0],[1,0],[-1,-1],[1,-1]];
+        for (const [dx, dy] of dirs) {
+          const nx = x+dx, ny = y+dy;
+          const neighbor = get(nx, ny);
+          if (neighbor === WOOD && Math.random() < 0.02) {
+            set(nx, ny, FIRE); life[idx(nx,ny)] = 0;
+          } else if (neighbor === OIL && Math.random() < 0.08) {
+            set(nx, ny, FIRE); life[idx(nx,ny)] = 0;
+          } else if (neighbor === GUNPOWDER && Math.random() < 0.4) {
+            set(nx, ny, FIRE); life[idx(nx,ny)] = 0;
+            // explosion — clear nearby
+            for (let ex = -2; ex <= 2; ex++) {
+              for (let ey = -2; ey <= 2; ey++) {
+                const enx = nx+ex, eny = ny+ey;
+                if (enx >= 0 && enx < W && eny >= 0 && eny < H) {
+                  const em = get(enx, eny);
+                  if (em === GUNPOWDER) { set(enx, eny, FIRE); life[idx(enx,eny)] = 0; }
+                  else if (em !== STONE && Math.random() < 0.3) { set(enx, eny, FIRE); life[idx(enx,eny)] = 10; }
+                }
+              }
+            }
+          } else if (neighbor === WATER) {
+            // water puts out fire
+            grid[i] = STEAM; life[i] = 0;
+            set(nx, ny, STEAM); life[idx(nx,ny)] = 0;
+            break;
+          }
+        }
+        // fire rises slightly
+        if (Math.random() < 0.4 && get(x, y-1) === EMPTY) {
+          swap(x, y, x, y-1);
+        } else if (Math.random() < 0.2) {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          if (get(x+dir, y-1) === EMPTY) swap(x, y, x+dir, y-1);
+        }
+      }
+
+      else if (mat === STEAM) {
+        life[i]++;
+        if (life[i] > 60 + Math.random() * 40) {
+          grid[i] = EMPTY; life[i] = 0;
+          continue;
+        }
+        if (get(x, y-1) === EMPTY) {
+          swap(x, y, x, y-1);
+        } else {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          if (get(x+dir, y-1) === EMPTY) swap(x, y, x+dir, y-1);
+          else if (get(x+dir, y) === EMPTY) swap(x, y, x+dir, y);
+        }
+      }
+    }
+  }
+}
+
+function render() {
+  for (let i = 0; i < W * H; i++) {
+    const c = matColor(grid[i]);
+    pixels[i] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+  }
+  // draw to offscreen then scale
+  const offscreen = new OffscreenCanvas(W, H);
+  const octx = offscreen.getContext('2d');
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+}
+
+function paint() {
+  const r = brushSize;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx*dx + dy*dy > r*r) continue;
+      const px = mouseX + dx, py = mouseY + dy;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
+      if (material === EMPTY) {
+        set(px, py, EMPTY);
+        life[idx(px, py)] = 0;
+      } else if (get(px, py) === EMPTY || material === EMPTY) {
+        // slight randomness so it doesn't look like a perfect circle
+        if (Math.random() < 0.7) {
+          set(px, py, material);
+          life[idx(px, py)] = 0;
+        }
+      }
+    }
+  }
+}
+
+function loop() {
+  if (mouseDown) paint();
+  simulate();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// Input
+canvas.addEventListener('mousedown', e => {
+  mouseDown = true;
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) | 0) / SCALE | 0;
+});
+canvas.addEventListener('mouseup', () => mouseDown = false);
+canvas.addEventListener('mouseleave', () => mouseDown = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(20, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = `Brush: ${brushSize}`;
+}, { passive: false });
+
+// Material buttons
+const matMap = { sand: SAND, water: WATER, stone: STONE, fire: FIRE, wood: WOOD, oil: OIL, gunpowder: GUNPOWDER, erase: EMPTY };
+document.querySelectorAll('.btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const m = btn.dataset.mat;
+    if (m === 'clear') {
+      grid.fill(0);
+      life.fill(0);
+      return;
+    }
+    material = matMap[m];
+    document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  const keys = { '1': SAND, '2': WATER, '3': STONE, '4': FIRE, '5': WOOD, '6': OIL, '7': GUNPOWDER, '0': EMPTY };
+  if (keys[e.key] !== undefined) {
+    material = keys[e.key];
+    document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+    const names = { [SAND]:'sand', [WATER]:'water', [STONE]:'stone', [FIRE]:'fire', [WOOD]:'wood', [OIL]:'oil', [GUNPOWDER]:'gunpowder', [EMPTY]:'erase' };
+    const target = document.querySelector(`[data-mat="${names[material]}"]`);
+    if (target) target.classList.add('active');
+  }
+  if (e.key === 'c') { grid.fill(0); life.fill(0); }
+});
+
+loop();
+</script>
+</body>
+</html>

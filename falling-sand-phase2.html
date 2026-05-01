@@ -1,0 +1,2230 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spark's Falling Sand — Phase 2: INCOMING</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 4px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 1020px; justify-content: center; }
+.btn { padding: 4px 8px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; line-height: 1.2; transition: background 0.1s; }
+.btn.active { border-color: #fff; background: #3a3a5e; }
+.btn:hover { background: #3a3a5e; }
+.btn .key { font-size: 9px; color: #888; display: block; }
+.sep { width: 1px; height: 28px; background: #444; margin: 0 4px; }
+h1 { font-size: 14px; margin-bottom: 6px; color: #888; }
+.status { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #666; }
+.status .warn { color: #c44; }
+.info { margin-top: 4px; font-size: 10px; color: #555; max-width: 1020px; text-align: center; }
+.warhead-active { border-color: #f44 !important; background: #3e1a1a !important; }
+</style>
+</head>
+<body>
+<h1>falling sand — phase 2: structural integrity & INCOMING</h1>
+<div class="toolbar" id="toolbar"></div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span>
+  <span id="particles">0 particles</span>
+  <span id="brush-label">Brush: 3</span>
+  <span id="mode-label"></span>
+</div>
+<div class="info">Draw: click+drag · Brush: scroll · M: cycle warheads (napalm→bunker→railgun→mortar→cluster) · G: city · V: thermal · X: stress · Space: pause · C: clear</div>
+
+<script>
+const W = 300, H = 200, SCALE = 3;
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ==================== MATERIALS ====================
+
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, FIRE = 4, WOOD = 5, OIL = 6, GUNPOWDER = 7;
+const STEAM = 8, ACID = 9, LAVA = 10, ICE = 11, SMOKE = 12, PLANT = 13, SALT = 14, METAL = 15;
+const GAS = 16, CLONE = 17, VOID = 18, EMBER = 19;
+const CONCRETE = 20, GLASS = 21, BRICK = 22, NAPALM = 23;
+const MAT_COUNT = 24;
+
+const DENSITY  = [0, 4, 3, 8, 0, 5, 2, 4, 0, 3, 7, 3, 0, 5, 4, 9, 0, 10, 10, 0, 8, 5, 7, 3.5];
+const CONDUCT  = [0.02, 0.3, 0.6, 0.5, 0.1, 0.08, 0.12, 0.2, 0.04, 0.5, 0.8, 0.8, 0.02, 0.08, 0.3, 0.95, 0.05, 0, 0, 0.3, 0.4, 0.3, 0.35, 0.15];
+const STRENGTH = new Float32Array(MAT_COUNT);
+STRENGTH[STONE] = 4; STRENGTH[WOOD] = 2; STRENGTH[METAL] = 5;
+STRENGTH[CONCRETE] = 3; STRENGTH[GLASS] = 0.5; STRENGTH[BRICK] = 2.5;
+
+// Warhead types
+const WH_MORTAR = 0, WH_CLUSTER = 1, WH_NAPALM = 2, WH_BUNKER = 3, WH_RAILGUN = 4;
+const WH_NAMES = ['Mortar', 'Cluster', 'Napalm', 'Bunker', 'Railgun'];
+const WH_COUNT = 5;
+const ROOM_TEMP = 22;
+
+// ==================== STATE ====================
+
+const grid = new Uint8Array(W * H);
+const temp = new Float32Array(W * H);
+const life = new Uint8Array(W * H);
+const updated = new Uint8Array(W * H);
+const imgData = ctx.createImageData(W, H);
+const pixels = new Uint32Array(imgData.data.buffer);
+const offscreen = new OffscreenCanvas(W, H);
+const octx = offscreen.getContext('2d');
+
+// Pre-allocated buffers for structural integrity
+const supportBuf = new Uint8Array(W * H);
+const groupBuf = new Uint8Array(W * H);
+const weightBuf = new Float32Array(W * H);
+
+temp.fill(ROOM_TEMP);
+
+let material = SAND;
+let brushSize = 3;
+let mouseDown = false;
+let mouseX = 0, mouseY = 0;
+let paused = false;
+let showTemp = false;
+let showStress = false;
+let warheadMode = false;
+let warheadType = WH_NAPALM;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let currentFps = 60;
+
+const chunks = [];
+const warheads = [];
+let integrityDirty = false;
+let integrityTimer = 0;
+
+// ==================== HELPERS ====================
+
+function idx(x, y) { return y * W + x; }
+function inBounds(x, y) { return x >= 0 && x < W && y >= 0 && y < H; }
+function get(x, y) { return inBounds(x, y) ? grid[idx(x, y)] : STONE; }
+function getTemp(x, y) { return inBounds(x, y) ? temp[idx(x, y)] : ROOM_TEMP; }
+
+function set(x, y, m, t) {
+  if (!inBounds(x, y)) return;
+  const i = idx(x, y);
+  grid[i] = m;
+  if (t !== undefined) temp[i] = t;
+}
+
+function swap(x1, y1, x2, y2) {
+  const i1 = idx(x1, y1), i2 = idx(x2, y2);
+  let t;
+  t = grid[i1]; grid[i1] = grid[i2]; grid[i2] = t;
+  t = life[i1]; life[i1] = life[i2]; life[i2] = t;
+  t = temp[i1]; temp[i1] = temp[i2]; temp[i2] = t;
+  updated[i2] = 1;
+}
+
+function isPowder(m) { return m === SAND || m === GUNPOWDER || m === SALT; }
+function isLiquid(m) { return m === WATER || m === OIL || m === ACID || m === LAVA; }
+function isGas(m) { return m === STEAM || m === SMOKE || m === GAS || m === EMBER; }
+function isSolid(m) { return m === STONE || m === WOOD || m === ICE || m === PLANT || m === METAL || m === CLONE || m === VOID || m === CONCRETE || m === GLASS || m === BRICK; }
+function isStructural(m) { return STRENGTH[m] > 0; }
+
+function canDisplace(mover, target) {
+  if (target === EMPTY) return true;
+  if (isSolid(target)) return false;
+  if (isGas(mover)) return false;
+  return DENSITY[mover] > DENSITY[target];
+}
+
+const NEIGHBOR4 = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+const NEIGHBOR8 = [[0,-1],[0,1],[-1,0],[1,0],[-1,-1],[1,-1],[-1,1],[1,1]];
+
+// ==================== COLORS ====================
+
+function varyColor(base, amount) {
+  const v = (Math.random() - 0.5) * amount * 2;
+  return [
+    Math.max(0, Math.min(255, base[0] + v)),
+    Math.max(0, Math.min(255, base[1] + v)),
+    Math.max(0, Math.min(255, base[2] + v)),
+  ];
+}
+
+function matColor(mat) {
+  switch (mat) {
+    case SAND: return varyColor([210, 180, 100], 15);
+    case WATER: return varyColor([40, 80, 200], 20);
+    case STONE: return varyColor([120, 120, 130], 10);
+    case FIRE: return [255, 80 + Math.random() * 120 | 0, Math.random() * 40 | 0];
+    case WOOD: return varyColor([100, 65, 30], 10);
+    case OIL: return varyColor([60, 40, 70], 8);
+    case GUNPOWDER: return varyColor([80, 80, 80], 8);
+    case STEAM: return [180 + Math.random() * 40 | 0, 180 + Math.random() * 40 | 0, 210 + Math.random() * 30 | 0];
+    case ACID: return varyColor([30, 220, 50], 25);
+    case LAVA:
+      if (Math.random() > 0.7) return [255, 180 + Math.random() * 75 | 0, 30 + Math.random() * 60 | 0];
+      return varyColor([200, 60, 10], 20);
+    case ICE: return varyColor([180, 215, 250], 8);
+    case SMOKE: return [70 + Math.random() * 30 | 0, 70 + Math.random() * 30 | 0, 75 + Math.random() * 30 | 0];
+    case PLANT: return varyColor([30, 140 + Math.random() * 40 | 0, 35], 12);
+    case SALT: return varyColor([230, 230, 240], 8);
+    case METAL: return varyColor([170, 175, 182], 6);
+    case GAS: return varyColor([140, 180, 40], 20);
+    case CLONE: return [50 + Math.random() * 40 | 0, 190 + Math.random() * 30 | 0, 200 + Math.random() * 30 | 0];
+    case VOID: {
+      if (Math.random() < 0.12) return [120, 30, 180];
+      return [20 + Math.random() * 15 | 0, 0, 30 + Math.random() * 15 | 0];
+    }
+    case EMBER: return [255, 150 + Math.random() * 105 | 0, Math.random() * 50 | 0];
+    case CONCRETE: return varyColor([160, 160, 155], 8);
+    case GLASS: {
+      const shimmer = Math.random() * 20 | 0;
+      return [170 + shimmer, 200 + shimmer, 225 + (Math.random() * 15 | 0)];
+    }
+    case BRICK: return varyColor([155, 70, 45], 12);
+    case NAPALM: {
+      const flicker = Math.random();
+      if (flicker < 0.3) return [255, 120 + Math.random() * 60 | 0, 20];
+      if (flicker < 0.6) return [240, 80 + Math.random() * 40 | 0, 10];
+      return [200, 60 + Math.random() * 30 | 0, 5];
+    }
+    default: return [26, 26, 46];
+  }
+}
+
+function thermalTint(r, g, b, t) {
+  if (t > 60) {
+    const f = Math.min(1, (t - 60) / 400);
+    r = Math.min(255, r + f * 120);
+    g = Math.min(255, g + f * 25);
+    b = Math.max(0, b - f * 60);
+  } else if (t < 5) {
+    const f = Math.min(1, (5 - t) / 30);
+    r = Math.max(0, r - f * 40);
+    g = Math.min(255, g + f * 15);
+    b = Math.min(255, b + f * 80);
+  }
+  return [r | 0, g | 0, b | 0];
+}
+
+function stressHeatmap(w, mat) {
+  if (!isStructural(mat) || STRENGTH[mat] === 0) return [26, 26, 46];
+  const stress = w / STRENGTH[mat];
+  if (stress < 2) return [20, 80, 20]; // green: low stress
+  if (stress < 8) { const f = (stress - 2) / 6; return [20 + f * 200 | 0, 80 + f * 100 | 0, 20]; } // green→yellow
+  if (stress < 15) { const f = (stress - 8) / 7; return [220, 180 - f * 130 | 0, 20]; } // yellow→orange
+  if (stress < 18) { const f = (stress - 15) / 3; return [220 + f * 35 | 0, 50 - f * 30 | 0, 20]; } // orange→red
+  // Over limit: pulsing red/white
+  const pulse = Math.sin(performance.now() * 0.01) * 0.3 + 0.7;
+  return [255 * pulse | 0, 30 * pulse | 0, 30 * pulse | 0];
+}
+
+function tempHeatmap(t) {
+  if (t < 0) {
+    const f = Math.min(1, -t / 30);
+    return [20, 40 + f * 80 | 0, 100 + f * 155 | 0];
+  }
+  if (t < 25) return [30, 30, 50];
+  const hot = t - 25;
+  if (hot < 75) { const f = hot / 75; return [f * 200 | 0, f * 150 | 0, 20]; }
+  if (hot < 275) { const f = (hot - 75) / 200; return [200 + f * 55 | 0, 150 - f * 100 | 0, 0]; }
+  if (hot < 675) { const f = (hot - 275) / 400; return [255, 50 + f * 130 | 0, f * 60 | 0]; }
+  return [255, 200, 100];
+}
+
+// ==================== THERMAL ====================
+
+function simulateThermal() {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+
+      if (mat === EMPTY) {
+        if (Math.abs(temp[i] - ROOM_TEMP) < 0.5) { temp[i] = ROOM_TEMP; continue; }
+        temp[i] += (ROOM_TEMP - temp[i]) * 0.1;
+        continue;
+      }
+
+      if (mat === CLONE || mat === VOID) continue;
+
+      if (mat === FIRE) temp[i] = Math.max(temp[i], 400 + Math.random() * 200);
+      else if (mat === LAVA) temp[i] = Math.max(temp[i], 700 + Math.random() * 150);
+      else if (mat === ICE) temp[i] = Math.min(temp[i], -5);
+      else if (mat === EMBER) temp[i] = Math.max(temp[i], 300 + Math.random() * 100);
+
+      const myCond = CONDUCT[mat];
+      let heatFlow = 0;
+      let neighbors = 0;
+
+      for (const [dx, dy] of NEIGHBOR4) {
+        const nx = x + dx, ny = y + dy;
+        if (!inBounds(nx, ny)) continue;
+        const ni = idx(nx, ny);
+        const avgCond = (myCond + CONDUCT[grid[ni]]) * 0.5;
+        heatFlow += (temp[ni] - temp[i]) * avgCond;
+        neighbors++;
+      }
+
+      if (neighbors > 0) temp[i] += heatFlow / neighbors * 0.15;
+      temp[i] += (ROOM_TEMP - temp[i]) * 0.001;
+      if (temp[i] < -50) temp[i] = -50;
+      if (temp[i] > 1200) temp[i] = 1200;
+    }
+  }
+}
+
+// ==================== EXPLOSIONS ====================
+
+function explode(cx, cy, radius) {
+  const displaced = [];
+
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 > radius * radius) continue;
+      const nx = cx + dx, ny = cy + dy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      const m = grid[ni];
+
+      const heatAmt = Math.max(0, 500 * (1 - Math.sqrt(dist2) / radius));
+      temp[ni] = Math.max(temp[ni], heatAmt);
+
+      if (m === EMPTY || m === CLONE || m === VOID || isGas(m) || m === FIRE) continue;
+
+      if (m === GUNPOWDER) {
+        grid[ni] = FIRE; life[ni] = 0; temp[ni] = 600;
+        continue;
+      }
+
+      const dist = Math.sqrt(dist2) || 0.5;
+      const force = 1 - dist / radius;
+
+      // Structural resistance: stronger materials need more force to break
+      if (isStructural(m)) {
+        const threshold = 0.15 * STRENGTH[m];
+        if (force < threshold) continue;
+        // Fuzzy edge: probabilistic survival near threshold
+        if (force < threshold * 2 && Math.random() > (force - threshold) / threshold) continue;
+        // Glass shatters to sand fragments instead of being flung
+        if (m === GLASS) {
+          grid[ni] = Math.random() < 0.6 ? SAND : EMPTY;
+          temp[ni] = heatAmt;
+          life[ni] = 0;
+          continue;
+        }
+      } else {
+        // Original non-structural check
+        if ((m === STONE || m === METAL) && force < 0.5) continue;
+      }
+
+      const flingDist = Math.max(1, Math.round(force * radius * 2));
+      const dirX = dx / dist;
+      const dirY = dy / dist;
+
+      displaced.push({
+        x: nx, y: ny, mat: m,
+        temp: temp[ni], life: life[ni],
+        dirX, dirY, flingDist, dist
+      });
+
+      grid[ni] = EMPTY; temp[ni] = ROOM_TEMP; life[ni] = 0;
+    }
+  }
+
+  displaced.sort((a, b) => b.dist - a.dist);
+
+  for (const p of displaced) {
+    let placed = false;
+    for (let s = p.flingDist; s >= 1; s--) {
+      const tx = Math.round(p.x + p.dirX * s);
+      const ty = Math.round(p.y + p.dirY * s);
+      if (!inBounds(tx, ty)) continue;
+      if (grid[idx(tx, ty)] === EMPTY) {
+        const ti = idx(tx, ty);
+        grid[ti] = p.mat; temp[ti] = p.temp; life[ti] = p.life;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed && grid[idx(p.x, p.y)] === EMPTY) {
+      const oi = idx(p.x, p.y);
+      grid[oi] = p.mat; temp[oi] = p.temp; life[oi] = p.life;
+    }
+  }
+
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 > radius * radius) continue;
+      const nx = cx + dx, ny = cy + dy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      if (grid[ni] === EMPTY) {
+        const chance = 0.3 * (1 - Math.sqrt(dist2) / radius);
+        if (Math.random() < chance) {
+          grid[ni] = FIRE; life[ni] = Math.random() * 10 | 0;
+        }
+      }
+    }
+  }
+
+  for (let e = 0; e < 5 + radius; e++) {
+    const angle = Math.random() * Math.PI * 2;
+    const edist = 1 + Math.random() * radius * 0.6;
+    const ex = Math.round(cx + Math.cos(angle) * edist);
+    const ey = Math.round(cy + Math.sin(angle) * edist);
+    if (inBounds(ex, ey) && grid[idx(ex, ey)] === EMPTY) {
+      const ei = idx(ex, ey);
+      grid[ei] = EMBER; life[ei] = 0; temp[ei] = 400;
+    }
+  }
+
+  // Trigger structural integrity check after explosion
+  integrityDirty = true;
+  integrityTimer = 3;
+}
+
+// ==================== STRUCTURAL INTEGRITY ====================
+
+function checkIntegrity() {
+  supportBuf.fill(0);
+
+  // Seed BFS from all structural pixels in the bottom row
+  const queue = [];
+  for (let x = 0; x < W; x++) {
+    const i = idx(x, H - 1);
+    if (isStructural(grid[i])) {
+      supportBuf[i] = 1;
+      queue.push(i);
+    }
+  }
+
+  // BFS through connected structural pixels (8-way: diagonal braces count)
+  let head = 0;
+  while (head < queue.length) {
+    const ci = queue[head++];
+    const cx = ci % W, cy = (ci / W) | 0;
+
+    for (const [dx, dy] of NEIGHBOR8) {
+      const nx = cx + dx, ny = cy + dy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      if (!supportBuf[ni] && isStructural(grid[ni])) {
+        supportBuf[ni] = 1;
+        queue.push(ni);
+      }
+    }
+  }
+
+  // Collect unsupported structural pixels
+  groupBuf.fill(0);
+  const unsupported = [];
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      if (isStructural(grid[i]) && !supportBuf[i]) {
+        groupBuf[i] = 1;
+        unsupported.push(i);
+      }
+    }
+  }
+
+  if (unsupported.length > 0) {
+    // Group into connected components (8-way)
+    for (const startI of unsupported) {
+      if (groupBuf[startI] !== 1) continue;
+
+      const component = [];
+      const cq = [startI];
+      groupBuf[startI] = 2;
+      let ch = 0;
+
+      while (ch < cq.length) {
+        const ci = cq[ch++];
+        component.push(ci);
+        const cx = ci % W, cy = (ci / W) | 0;
+
+        for (const [dx, dy] of NEIGHBOR8) {
+          const nx = cx + dx, ny = cy + dy;
+          if (!inBounds(nx, ny)) continue;
+          const ni = idx(nx, ny);
+          if (groupBuf[ni] === 1) {
+            groupBuf[ni] = 2;
+            cq.push(ni);
+          }
+        }
+      }
+
+      if (component.length > 0) createChunk(component);
+    }
+  }
+
+  // Weight-based stress check on still-supported structure
+  checkStress();
+}
+
+// ==================== WEIGHT-BASED STRESS ====================
+
+function checkStress() {
+  weightBuf.fill(0);
+  const STRESS_LIMIT = 18;
+
+  // Top-to-bottom sweep: accumulate weight through structure
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      if (!isStructural(grid[i]) || !supportBuf[i]) continue;
+
+      // Self-weight
+      weightBuf[i] += 1;
+
+      // Weight from non-structural material resting above
+      if (y > 0) {
+        const above = grid[idx(x, y - 1)];
+        if (above !== EMPTY && !isStructural(above) && !isGas(above) && above !== FIRE) {
+          weightBuf[i] += 0.5;
+        }
+      }
+
+      // Distribute accumulated weight to structural neighbors below
+      const below = [];
+      for (const [dx, dy] of [[-1, 1], [0, 1], [1, 1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (inBounds(nx, ny)) {
+          const ni = idx(nx, ny);
+          if (isStructural(grid[ni]) && supportBuf[ni]) {
+            below.push(ni);
+          }
+        }
+      }
+
+      if (below.length > 0) {
+        const share = weightBuf[i] / below.length;
+        for (const bi of below) {
+          weightBuf[bi] += share;
+        }
+      }
+    }
+  }
+
+  // Break over-stressed pixels
+  let broken = false;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      if (!isStructural(grid[i]) || !supportBuf[i]) continue;
+
+      const stress = weightBuf[i] / STRENGTH[grid[i]];
+      if (stress > STRESS_LIMIT) {
+        const excessRatio = (stress - STRESS_LIMIT) / STRESS_LIMIT;
+        if (Math.random() < Math.min(0.5, excessRatio * 0.12)) {
+          const mat = grid[i];
+          if (mat === GLASS) {
+            grid[i] = SAND;
+          } else {
+            grid[i] = Math.random() < 0.3 ? SAND : EMPTY;
+          }
+          temp[i] = ROOM_TEMP;
+          life[i] = 0;
+          broken = true;
+        }
+      }
+    }
+  }
+
+  if (broken) {
+    integrityDirty = true;
+    integrityTimer = Math.max(integrityTimer, 2);
+  }
+}
+
+// ==================== FALLING CHUNKS ====================
+
+function createChunk(pixelIndices) {
+  let sumX = 0, sumY = 0;
+  let minY = H, maxY = 0;
+  for (const i of pixelIndices) {
+    const x = i % W, y = (i / W) | 0;
+    sumX += x;
+    sumY += y;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const anchorX = Math.round(sumX / pixelIndices.length);
+  const anchorY = Math.round(sumY / pixelIndices.length);
+
+  // Calculate horizontal lean: where the chunk lost support
+  // Check which side of the chunk's bottom had structural neighbors that are now gone
+  let leftSupport = 0, rightSupport = 0;
+  for (const i of pixelIndices) {
+    const x = i % W, y = (i / W) | 0;
+    if (y !== maxY) continue; // only bottom row of chunk
+    // Check below-left and below-right for remaining structure
+    if (inBounds(x - 1, y + 1) && isStructural(grid[idx(x - 1, y + 1)]) && supportBuf[idx(x - 1, y + 1)]) leftSupport++;
+    if (inBounds(x + 1, y + 1) && isStructural(grid[idx(x + 1, y + 1)]) && supportBuf[idx(x + 1, y + 1)]) rightSupport++;
+  }
+  // Lean toward the side with less remaining support (topple into the gap)
+  let vx = 0;
+  if (leftSupport !== rightSupport) {
+    vx = leftSupport < rightSupport ? -0.3 : 0.3;
+  } else {
+    vx = (Math.random() - 0.5) * 0.2; // tiny random drift
+  }
+  // Taller chunks topple more dramatically
+  const height = maxY - minY + 1;
+  if (height > 8) vx *= 1 + (height - 8) * 0.05;
+
+  const chunkPixels = [];
+  for (const i of pixelIndices) {
+    const x = i % W, y = (i / W) | 0;
+    chunkPixels.push({
+      rx: x - anchorX,
+      ry: y - anchorY,
+      mat: grid[i],
+      temp: temp[i],
+      life: life[i]
+    });
+    grid[i] = EMPTY;
+    temp[i] = ROOM_TEMP;
+    life[i] = 0;
+  }
+
+  chunks.push({
+    x: anchorX,
+    y: anchorY,
+    vx: vx,
+    vy: 0,
+    fracX: 0,
+    fracY: 0,
+    pixels: chunkPixels
+  });
+}
+
+function updateChunks() {
+  const GRAVITY = 0.15;
+  const settled = [];
+
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    chunk.vy += GRAVITY;
+    if (chunk.vy > 6) chunk.vy = 6;
+    chunk.fracY += chunk.vy;
+    chunk.fracX += chunk.vx;
+
+    // Horizontal movement
+    const hSteps = Math.floor(Math.abs(chunk.fracX));
+    const hDir = chunk.vx > 0 ? 1 : -1;
+    chunk.fracX -= hSteps * hDir;
+    for (let s = 0; s < hSteps; s++) {
+      let hBlocked = false;
+      for (const p of chunk.pixels) {
+        const wx = chunk.x + p.rx + hDir;
+        const wy = chunk.y + p.ry;
+        if (wx < 0 || wx >= W) { hBlocked = true; break; }
+        if (wy < 0 || wy >= H) continue;
+        const m = grid[idx(wx, wy)];
+        if (isSolid(m) || isPowder(m)) { hBlocked = true; break; }
+      }
+      if (hBlocked) { chunk.vx *= -0.3; break; }
+      chunk.x += hDir;
+    }
+
+    // Vertical movement
+    const steps = Math.floor(chunk.fracY);
+    chunk.fracY -= steps;
+
+    let collided = false;
+    for (let s = 0; s < steps; s++) {
+      let blocked = false;
+      for (const p of chunk.pixels) {
+        const wy = chunk.y + p.ry + 1;
+        const wx = chunk.x + p.rx;
+        if (wy >= H) { blocked = true; break; }
+        if (wx < 0 || wx >= W) continue;
+        const gi = idx(wx, wy);
+        const m = grid[gi];
+        if (m !== EMPTY) {
+          if (isSolid(m) || isPowder(m)) {
+            blocked = true; break;
+          } else {
+            grid[gi] = EMPTY; temp[gi] = ROOM_TEMP; life[gi] = 0;
+          }
+        }
+      }
+
+      if (blocked) {
+        collided = true;
+        break;
+      }
+      chunk.y += 1;
+    }
+
+    if (collided) {
+      shatterChunk(chunk);
+      settled.push(ci);
+    }
+  }
+
+  for (let i = settled.length - 1; i >= 0; i--) {
+    chunks.splice(settled[i], 1);
+  }
+}
+
+function shatterChunk(chunk) {
+  const impactSpeed = chunk.vy;
+  let maxY = -Infinity;
+  let minY = Infinity;
+
+  for (const p of chunk.pixels) {
+    const wy = chunk.y + p.ry;
+    if (wy > maxY) maxY = wy;
+    if (wy < minY) minY = wy;
+  }
+
+  // Place pixels back on grid
+  for (const p of chunk.pixels) {
+    const wx = chunk.x + p.rx;
+    const wy = chunk.y + p.ry;
+    if (!inBounds(wx, wy)) continue;
+    const gi = idx(wx, wy);
+
+    let placeMat = p.mat;
+    let placeTemp = p.temp;
+
+    // Glass shatters on hard impact
+    if (p.mat === GLASS && impactSpeed > 2) {
+      placeMat = Math.random() < 0.35 ? SAND : EMPTY;
+      placeTemp = p.temp + impactSpeed * 5;
+    }
+
+    if (placeMat === EMPTY) continue;
+
+    if (grid[gi] === EMPTY) {
+      grid[gi] = placeMat;
+      temp[gi] = placeTemp;
+      life[gi] = p.life;
+    } else {
+      // Try nearby cells
+      let placed = false;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, -1], [1, -1], [-1, -1], [0, 1]]) {
+        const ax = wx + dx, ay = wy + dy;
+        if (inBounds(ax, ay) && grid[idx(ax, ay)] === EMPTY) {
+          const ai = idx(ax, ay);
+          grid[ai] = placeMat;
+          temp[ai] = placeTemp;
+          life[ai] = p.life;
+          placed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Impact effects: fire/ember spray and heat
+  if (impactSpeed > 1.5) {
+    const impactX = chunk.x;
+    const impactY = maxY + 1;
+    const effectRadius = Math.min(6, Math.floor(impactSpeed));
+
+    for (let dy = -effectRadius; dy <= effectRadius; dy++) {
+      for (let dx = -effectRadius; dx <= effectRadius; dx++) {
+        const d2 = dx * dx + dy * dy;
+        if (d2 > effectRadius * effectRadius) continue;
+        const fx = impactX + dx, fy = impactY + dy;
+        if (!inBounds(fx, fy)) continue;
+        const fi = idx(fx, fy);
+        const forceFrac = 1 - Math.sqrt(d2) / effectRadius;
+
+        temp[fi] += forceFrac * impactSpeed * 8;
+
+        // Glass near impact shatters
+        if (grid[fi] === GLASS && forceFrac > 0.3) {
+          grid[fi] = Math.random() < 0.5 ? SAND : EMPTY;
+        }
+
+        if (grid[fi] === EMPTY && Math.random() < forceFrac * 0.15) {
+          grid[fi] = Math.random() < 0.4 ? FIRE : EMBER;
+          life[fi] = 0;
+          temp[fi] = 300;
+        }
+      }
+    }
+
+    // Heavy impacts can break structural material below
+    if (impactSpeed > 3 && chunk.pixels.length > 20) {
+      for (let dx = -3; dx <= 3; dx++) {
+        const bx = impactX + dx, by = impactY;
+        if (!inBounds(bx, by)) continue;
+        const bi = idx(bx, by);
+        if (isStructural(grid[bi]) && STRENGTH[grid[bi]] < impactSpeed * 0.8) {
+          if (Math.random() < 0.3) {
+            grid[bi] = grid[bi] === GLASS ? EMPTY : SAND;
+            temp[bi] = 100;
+          }
+        }
+      }
+    }
+  }
+
+  integrityDirty = true;
+  integrityTimer = Math.max(integrityTimer, 4);
+}
+
+// ==================== NAPALM SIMULATION ====================
+
+function simNapalm(x, y) {
+  const i = idx(x, y);
+  life[i]++;
+
+  // Napalm burns hot
+  temp[i] = Math.max(temp[i], 500 + Math.random() * 200);
+
+  // Burn out over time
+  if (life[i] > 900 + Math.random() * 600) {
+    grid[i] = Math.random() < 0.3 ? SMOKE : EMPTY;
+    life[i] = 0;
+    temp[i] = Math.random() < 0.3 ? 200 : ROOM_TEMP;
+    return;
+  }
+
+  // Ignite and heat neighbors
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+
+    if (neighbor === WOOD || neighbor === OIL || neighbor === PLANT) {
+      temp[ni] = Math.max(temp[ni], 350);
+    }
+    if (neighbor === GUNPOWDER) {
+      temp[ni] = Math.max(temp[ni], 120);
+    }
+    if (neighbor === GAS) {
+      grid[ni] = FIRE; life[ni] = 0; temp[ni] = 400;
+    }
+    if (isStructural(neighbor)) {
+      temp[ni] += 3;
+    }
+    if (neighbor === WATER) {
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 110;
+      life[i] += 20; // water accelerates burnout but doesn't extinguish
+    }
+  }
+
+  // Emit smoke
+  if (Math.random() < 0.06) {
+    if (inBounds(x, y - 1) && get(x, y - 1) === EMPTY) {
+      set(x, y - 1, SMOKE, 200);
+      life[idx(x, y - 1)] = 0;
+    }
+  }
+
+  // Emit flickering fire above
+  if (Math.random() < 0.08) {
+    const fx = x + (Math.random() > 0.5 ? 1 : -1);
+    if (inBounds(fx, y - 1) && get(fx, y - 1) === EMPTY) {
+      const fi = idx(fx, y - 1);
+      grid[fi] = FIRE; life[fi] = 10; temp[fi] = 450;
+    }
+  }
+
+  // Sticky flow: moves slowly, clings to surfaces
+  if (Math.random() > 0.3) return; // only moves 30% of ticks
+
+  let touchingSolid = false;
+  for (const [dx, dy] of NEIGHBOR4) {
+    const neighbor = get(x + dx, y + dy);
+    if (isSolid(neighbor) || isPowder(neighbor)) { touchingSolid = true; break; }
+  }
+
+  const below = get(x, y + 1);
+  if (below === EMPTY) {
+    if (!touchingSolid || Math.random() < 0.4) {
+      swap(x, y, x, y + 1);
+    }
+  } else if (below === WATER) {
+    swap(x, y, x, y + 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y + 1) === EMPTY) swap(x, y, x + dir, y + 1);
+    else if (get(x - dir, y + 1) === EMPTY) swap(x, y, x - dir, y + 1);
+    else if (get(x + dir, y) === EMPTY && Math.random() < 0.15) swap(x, y, x + dir, y);
+  }
+}
+
+// ==================== WARHEAD SYSTEM ====================
+
+function launchWarhead(targetX, targetY) {
+  if (warheadType === WH_RAILGUN) {
+    fireRailgun(targetX, targetY);
+    return;
+  }
+
+  const startX = targetX + (Math.random() - 0.5) * 30;
+  const w = {
+    x: startX,
+    y: -5,
+    vx: (targetX - startX) * 0.02,
+    vy: 1.5,
+    type: warheadType,
+    split: false,
+    penetrating: false,
+    penHealth: 0,
+  };
+
+  // Bunker buster: heavier, faster descent
+  if (warheadType === WH_BUNKER) {
+    w.vy = 2.5;
+    w.penHealth = 50; // penetration budget
+  }
+
+  warheads.push(w);
+}
+
+// --- Cluster bomb split ---
+function clusterSplit(w) {
+  const count = 8 + Math.floor(Math.random() * 5); // 8-12 submunitions
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 1.2 - Math.PI * 0.6; // spread ~120 degrees downward
+    const speed = 0.8 + Math.random() * 0.6;
+    warheads.push({
+      x: w.x,
+      y: w.y,
+      vx: Math.sin(angle) * speed + w.vx,
+      vy: Math.cos(angle) * speed * 0.5 + Math.abs(w.vy) * 0.3,
+      type: -1, // submunition marker
+      split: false,
+      penetrating: false,
+      penHealth: 0,
+    });
+  }
+}
+
+// --- Napalm splash ---
+function napalmSplash(cx, cy, radius) {
+  // Small initial explosion (weaker than mortar)
+  explode(cx, cy, 5);
+
+  // Spawn napalm gel in splash pattern
+  const napalmCount = 30 + Math.floor(Math.random() * 20);
+  for (let n = 0; n < napalmCount; n++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 1 + Math.random() * radius;
+    const nx = Math.round(cx + Math.cos(angle) * dist);
+    const ny = Math.round(cy + Math.sin(angle) * dist);
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    if (grid[ni] === EMPTY || grid[ni] === FIRE || isGas(grid[ni])) {
+      grid[ni] = NAPALM;
+      life[ni] = Math.floor(Math.random() * 30); // stagger burnout
+      temp[ni] = 600;
+    }
+  }
+
+  // Extra napalm drips above impact for dramatic splash
+  for (let d = 0; d < 8; d++) {
+    const dx = Math.round((Math.random() - 0.5) * radius * 2);
+    const dy = -Math.floor(Math.random() * 6) - 1;
+    const nx = cx + dx, ny = cy + dy;
+    if (inBounds(nx, ny) && grid[idx(nx, ny)] === EMPTY) {
+      grid[idx(nx, ny)] = NAPALM;
+      life[idx(nx, ny)] = Math.floor(Math.random() * 20);
+      temp[idx(nx, ny)] = 550;
+    }
+  }
+}
+
+// --- Bunker buster penetration ---
+function bunkerPenetrate(w) {
+  const gx = Math.round(w.x), gy = Math.round(w.y);
+
+  // Penetrate: destroy material at current position, lose health based on hardness
+  for (const [dx, dy] of [[0, 0], [-1, 0], [1, 0]]) {
+    const px = gx + dx, py = gy;
+    if (!inBounds(px, py)) continue;
+    const pi = idx(px, py);
+    const mat = grid[pi];
+    if (mat === EMPTY || isGas(mat) || mat === FIRE) continue;
+
+    // Calculate penetration cost based on material
+    let cost = 1;
+    if (isStructural(mat)) cost = STRENGTH[mat] * 1.5;
+    else if (mat === STONE) cost = 4;
+    else if (isPowder(mat)) cost = 0.5;
+    else if (isLiquid(mat)) cost = 0.2;
+
+    w.penHealth -= cost;
+
+    // Destroy the material (small debris)
+    if (isStructural(mat) && Math.random() < 0.4) {
+      grid[pi] = SAND; // rubble
+    } else {
+      grid[pi] = EMPTY;
+    }
+    temp[pi] = 200 + Math.random() * 100;
+  }
+
+  // Shake nearby pixels (micro-tremor during penetration)
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -3; dx <= 3; dx++) {
+      const nx = gx + dx, ny = gy + dy;
+      if (!inBounds(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      if (grid[ni] !== EMPTY && !isSolid(grid[ni]) && Math.random() < 0.1) {
+        const dir = Math.random() > 0.5 ? 1 : -1;
+        if (inBounds(nx + dir, ny) && grid[idx(nx + dir, ny)] === EMPTY) {
+          swap(nx, ny, nx + dir, ny);
+        }
+      }
+    }
+  }
+
+  // Trigger integrity check
+  integrityDirty = true;
+  integrityTimer = Math.max(integrityTimer, 2);
+
+  return w.penHealth <= 0;
+}
+
+// --- Railgun instant trace ---
+function fireRailgun(targetX, targetY) {
+  // Trace from top of screen through target and beyond
+  const startY = 0;
+  const endY = H - 1;
+  const dx = targetX; // x stays constant for vertical railgun
+
+  // Primary path: 1px wide clean destruction
+  for (let y = startY; y <= endY; y++) {
+    if (!inBounds(dx, y)) continue;
+    const pi = idx(dx, y);
+    const mat = grid[pi];
+
+    if (mat !== EMPTY) {
+      // Glass shatters to sand fragments
+      if (mat === GLASS) {
+        grid[pi] = Math.random() < 0.5 ? SAND : EMPTY;
+      } else if (mat === CLONE || mat === VOID) {
+        // Even clone/void are destroyed
+        grid[pi] = EMPTY;
+      } else {
+        grid[pi] = EMPTY;
+      }
+      temp[pi] = 300 + Math.random() * 200;
+      life[pi] = 0;
+    }
+  }
+
+  // Shockwave: 3-4px radius around the path
+  const shockRadius = 4;
+  for (let y = startY; y <= endY; y++) {
+    for (let sx = -shockRadius; sx <= shockRadius; sx++) {
+      if (sx === 0) continue;
+      const nx = dx + sx;
+      if (!inBounds(nx, y)) continue;
+      const ni = idx(nx, y);
+      const absDist = Math.abs(sx);
+      const forceFrac = 1 - absDist / shockRadius;
+
+      // Heat from shockwave
+      temp[ni] += forceFrac * 150;
+
+      const mat = grid[ni];
+      if (mat === EMPTY) continue;
+
+      // Glass shatters within 2px
+      if (mat === GLASS && absDist <= 2) {
+        grid[ni] = Math.random() < 0.6 ? SAND : EMPTY;
+        continue;
+      }
+
+      // Structural damage
+      if (isStructural(mat)) {
+        // Probability of breaking decreases with distance
+        if (Math.random() < forceFrac * 0.15) {
+          grid[ni] = mat === GLASS ? EMPTY : (Math.random() < 0.4 ? SAND : EMPTY);
+        }
+        continue;
+      }
+
+      // Fling non-structural, non-solid material away from path
+      if (!isSolid(mat) && !isGas(mat)) {
+        const flingDir = sx > 0 ? 1 : -1;
+        const flingDist = Math.ceil(forceFrac * 3);
+        for (let f = flingDist; f >= 1; f--) {
+          const fx = nx + flingDir * f;
+          if (inBounds(fx, y) && grid[idx(fx, y)] === EMPTY) {
+            swap(nx, y, fx, y);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Visual: spawn embers along the path
+  for (let y = 0; y < H; y += 2 + Math.floor(Math.random() * 3)) {
+    if (inBounds(dx, y) && grid[idx(dx, y)] === EMPTY) {
+      grid[idx(dx, y)] = EMBER;
+      life[idx(dx, y)] = 0;
+      temp[idx(dx, y)] = 400;
+    }
+    // Side embers
+    for (const side of [-1, 1]) {
+      if (Math.random() < 0.2 && inBounds(dx + side, y) && grid[idx(dx + side, y)] === EMPTY) {
+        grid[idx(dx + side, y)] = EMBER;
+        life[idx(dx + side, y)] = 0;
+        temp[idx(dx + side, y)] = 300;
+      }
+    }
+  }
+
+  // Trigger structural integrity check
+  integrityDirty = true;
+  integrityTimer = 2;
+}
+
+function updateWarheads() {
+  const toRemove = [];
+  for (let i = 0; i < warheads.length; i++) {
+    const w = warheads[i];
+
+    // Bunker buster in penetration mode
+    if (w.penetrating) {
+      w.vy += 0.02; // slower acceleration underground
+      w.y += w.vy * 0.5; // slower movement during penetration
+      const gx = Math.round(w.x), gy = Math.round(w.y);
+
+      if (gy >= H) {
+        explode(gx, H - 1, 12);
+        toRemove.push(i);
+        continue;
+      }
+
+      const shouldDetonate = bunkerPenetrate(w);
+      if (shouldDetonate) {
+        // Deep detonation — bigger explosion
+        explode(gx, gy, 14);
+        toRemove.push(i);
+      }
+      continue;
+    }
+
+    // Normal flight
+    const gravity = w.type === WH_BUNKER ? 0.1 : 0.06;
+    w.vy += gravity;
+    w.x += w.vx;
+    w.y += w.vy;
+
+    const gx = Math.round(w.x), gy = Math.round(w.y);
+
+    // Cluster bomb: split when past 40% of screen height
+    if (w.type === WH_CLUSTER && !w.split && gy > H * 0.35) {
+      w.split = true;
+      clusterSplit(w);
+      toRemove.push(i);
+      continue;
+    }
+
+    // Out of bounds bottom
+    if (gy >= H) {
+      warheadImpact(w, gx, H - 1);
+      if (!w.penetrating) toRemove.push(i);
+      continue;
+    }
+
+    // Hit something
+    if (gy >= 0 && inBounds(gx, gy) && grid[idx(gx, gy)] !== EMPTY && !isGas(grid[idx(gx, gy)])) {
+      warheadImpact(w, gx, gy);
+      if (!w.penetrating) toRemove.push(i);
+      continue;
+    }
+
+    // Check small area for collision (warhead has width)
+    if (gy >= 0) {
+      let hit = false;
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, 1]]) {
+        const hx = gx + dx, hy = gy + dy;
+        if (inBounds(hx, hy) && grid[idx(hx, hy)] !== EMPTY && !isGas(grid[idx(hx, hy)])) {
+          warheadImpact(w, hx, hy);
+          hit = true;
+          break;
+        }
+      }
+      if (hit && !w.penetrating) { toRemove.push(i); continue; }
+    }
+  }
+
+  for (let i = toRemove.length - 1; i >= 0; i--) {
+    warheads.splice(toRemove[i], 1);
+  }
+}
+
+// Route warhead impact to the right behavior
+function warheadImpact(w, hx, hy) {
+  switch (w.type) {
+    case WH_MORTAR:
+      explode(hx, hy, 10);
+      break;
+    case WH_CLUSTER:
+      // Direct hit before split — still split
+      clusterSplit(w);
+      break;
+    case WH_NAPALM:
+      napalmSplash(hx, hy, 8);
+      break;
+    case WH_BUNKER:
+      // Enter penetration mode
+      w.penetrating = true;
+      w.vy = Math.max(w.vy, 2);
+      break;
+    case -1: // Cluster submunition
+      explode(hx, hy, 4 + Math.floor(Math.random() * 2));
+      break;
+    default:
+      explode(hx, hy, 10);
+  }
+}
+
+// ==================== CITY GENERATOR ====================
+
+function generateCity() {
+  grid.fill(0); life.fill(0); temp.fill(ROOM_TEMP);
+  chunks.length = 0;
+  warheads.length = 0;
+  integrityDirty = false;
+  integrityTimer = 0;
+  weightBuf.fill(0);
+
+  const gnd = H - 3;
+
+  // Ground layer
+  for (let x = 0; x < W; x++) {
+    for (let y = gnd; y < H; y++) {
+      set(x, y, STONE, ROOM_TEMP);
+    }
+  }
+
+  // Track buildings for skybridge placement
+  const buildings = [];
+
+  // Generate buildings
+  let bx = 4 + (Math.random() * 8 | 0);
+  while (bx < W - 10) {
+    const bw = 14 + (Math.random() * 22 | 0);
+    let bh = 25 + (Math.random() * 70 | 0);
+    if (bh > gnd - 8) bh = gnd - 8;
+    const top = gnd - bh;
+    const wallMat = Math.random() < 0.45 ? BRICK : CONCRETE;
+    const floorSpace = 7 + (Math.random() * 4 | 0);
+
+    // Outer walls (2px thick for structural stability)
+    for (let y = top; y < gnd; y++) {
+      set(bx, y, wallMat, ROOM_TEMP);
+      set(bx + 1, y, wallMat, ROOM_TEMP);
+      set(bx + bw - 1, y, wallMat, ROOM_TEMP);
+      set(bx + bw - 2, y, wallMat, ROOM_TEMP);
+    }
+
+    // Roof style
+    const roofStyle = Math.random();
+    if (roofStyle < 0.3 && bw > 16) {
+      // Peaked roof
+      const midX = bx + (bw / 2 | 0);
+      const peakH = 4 + (Math.random() * 4 | 0);
+      for (let rx = bx; rx < bx + bw; rx++) {
+        const distFromCenter = Math.abs(rx - midX);
+        const roofY = top - Math.round(peakH * (1 - distFromCenter / (bw / 2)));
+        if (roofY >= 0) {
+          for (let ry = roofY; ry <= top; ry++) {
+            if (inBounds(rx, ry)) set(rx, ry, CONCRETE, ROOM_TEMP);
+          }
+        }
+      }
+    } else {
+      // Flat roof (2px thick)
+      for (let x = bx; x < bx + bw; x++) {
+        set(x, top, CONCRETE, ROOM_TEMP);
+        set(x, top + 1, CONCRETE, ROOM_TEMP);
+      }
+    }
+
+    // Antenna tower on tall buildings
+    if (bh > 50 && Math.random() < 0.6) {
+      const antX = bx + (bw / 2 | 0);
+      const antH = 6 + (Math.random() * 10 | 0);
+      for (let ay = top - antH; ay < top; ay++) {
+        if (ay >= 0) set(antX, ay, METAL, ROOM_TEMP);
+      }
+      // Crossbar
+      if (antH > 8 && top - antH + 2 >= 0) {
+        const crossY = top - antH + 2;
+        for (let cx = -2; cx <= 2; cx++) {
+          if (inBounds(antX + cx, crossY)) set(antX + cx, crossY, METAL, ROOM_TEMP);
+        }
+      }
+    }
+
+    // Floors
+    const floors = [];
+    for (let fy = gnd - floorSpace; fy > top + 2; fy -= floorSpace) {
+      floors.push(fy);
+      for (let x = bx; x < bx + bw; x++) {
+        set(x, fy, CONCRETE, ROOM_TEMP);
+      }
+    }
+
+    // Internal metal supports
+    const supSpacing = 5 + (Math.random() * 4 | 0);
+    for (let sx = bx + 3; sx < bx + bw - 3; sx += supSpacing) {
+      for (let y = top + 2; y < gnd; y++) {
+        if (get(sx, y) === EMPTY) set(sx, y, METAL, ROOM_TEMP);
+      }
+    }
+
+    // Windows (glass panes between floors, in the walls)
+    for (let fi = 0; fi < floors.length; fi++) {
+      const floorY = floors[fi];
+      const ceilY = fi === 0 ? top + 2 : floors[fi - 1] + 1;
+      const winTop = ceilY + 1;
+      const winBot = floorY - 1;
+      if (winBot <= winTop) continue;
+
+      for (let wy = winTop; wy <= winBot; wy++) {
+        if ((wy - winTop) % 2 === 0) continue;
+        set(bx + 1, wy, GLASS, ROOM_TEMP);
+      }
+      for (let wy = winTop; wy <= winBot; wy++) {
+        if ((wy - winTop) % 2 === 0) continue;
+        set(bx + bw - 2, wy, GLASS, ROOM_TEMP);
+      }
+
+      for (let wx = bx + 4; wx < bx + bw - 4; wx += 3) {
+        if (get(wx, winTop) !== EMPTY) continue;
+        for (let wy = winTop; wy <= Math.min(winBot, winTop + 2); wy++) {
+          if (get(wx, wy) === EMPTY) set(wx, wy, GLASS, ROOM_TEMP);
+          if (wx + 1 < bx + bw - 2 && get(wx + 1, wy) === EMPTY) set(wx + 1, wy, GLASS, ROOM_TEMP);
+        }
+      }
+    }
+
+    // Ground floor door
+    const doorX = bx + (bw / 2 | 0) - 1;
+    for (let dx = 0; dx < 3; dx++) {
+      for (let dy = 1; dy <= 5; dy++) {
+        const gx = doorX + dx, gy = gnd - dy;
+        if (inBounds(gx, gy) && isStructural(get(gx, gy)) && get(gx, gy) !== METAL) {
+          set(gx, gy, EMPTY, ROOM_TEMP);
+        }
+      }
+    }
+
+    buildings.push({ x: bx, w: bw, top: top, right: bx + bw });
+
+    bx += bw + 2 + (Math.random() * 6 | 0);
+  }
+
+  // Skybridges between adjacent buildings
+  for (let i = 0; i < buildings.length - 1; i++) {
+    const a = buildings[i], b = buildings[i + 1];
+    const gap = b.x - a.right;
+    if (gap > 12 || gap < 2) continue;
+    if (Math.random() > 0.45) continue;
+
+    const bridgeY = Math.max(a.top, b.top) + 15 + (Math.random() * 20 | 0);
+    if (bridgeY >= gnd - 5) continue;
+
+    // Bridge deck
+    for (let bx2 = a.right - 1; bx2 <= b.x + 1; bx2++) {
+      if (inBounds(bx2, bridgeY)) set(bx2, bridgeY, CONCRETE, ROOM_TEMP);
+      if (inBounds(bx2, bridgeY + 1)) set(bx2, bridgeY + 1, CONCRETE, ROOM_TEMP);
+    }
+    // Glass walls on bridge
+    for (let bx2 = a.right; bx2 <= b.x; bx2++) {
+      if (inBounds(bx2, bridgeY - 1)) set(bx2, bridgeY - 1, GLASS, ROOM_TEMP);
+      if (inBounds(bx2, bridgeY - 2)) set(bx2, bridgeY - 2, GLASS, ROOM_TEMP);
+    }
+  }
+}
+
+// ==================== TRANSITIONS ====================
+
+function checkTransitions() {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+      const t = temp[i];
+
+      switch (mat) {
+        case WATER:
+          if (t >= 100) { grid[i] = STEAM; life[i] = 0; }
+          else if (t <= -2) { grid[i] = ICE; }
+          break;
+        case ICE:
+          if (t > 5) { grid[i] = WATER; }
+          break;
+        case STEAM:
+          if (t < 85) { grid[i] = WATER; life[i] = 0; }
+          break;
+        case LAVA:
+          if (t < 400) { grid[i] = STONE; temp[i] = 350; }
+          break;
+        case STONE:
+          if (t > 900 && Math.random() < 0.01) { grid[i] = LAVA; }
+          break;
+        case METAL:
+          if (t > 650 && Math.random() < 0.01) {
+            grid[i] = LAVA; temp[i] = 700;
+            integrityDirty = true; integrityTimer = Math.max(integrityTimer, 3);
+          }
+          break;
+        case WOOD:
+          if (t > 300) {
+            grid[i] = FIRE; life[i] = 0;
+            integrityDirty = true; integrityTimer = Math.max(integrityTimer, 3);
+          }
+          break;
+        case OIL:
+          if (t > 150) { grid[i] = FIRE; life[i] = 0; }
+          break;
+        case GUNPOWDER:
+          if (t > 100) {
+            grid[i] = FIRE; life[i] = 0; temp[i] = 600;
+            explode(x, y, 4);
+          }
+          break;
+        case PLANT:
+          if (t > 250) { grid[i] = FIRE; life[i] = 0; }
+          break;
+        case GAS:
+          if (t > 50) {
+            grid[i] = FIRE; life[i] = 0; temp[i] = Math.max(t, 400);
+            for (let dy2 = -2; dy2 <= 2; dy2++) {
+              for (let dx2 = -2; dx2 <= 2; dx2++) {
+                if (dx2 === 0 && dy2 === 0) continue;
+                const gx = x + dx2, gy = y + dy2;
+                if (inBounds(gx, gy) && grid[idx(gx, gy)] === GAS) {
+                  temp[idx(gx, gy)] = Math.max(temp[idx(gx, gy)], 60);
+                }
+              }
+            }
+            for (const [dx, dy] of NEIGHBOR4) {
+              const px = x + dx, py = y + dy;
+              if (!inBounds(px, py)) continue;
+              const pm = get(px, py);
+              if (pm !== EMPTY && !isGas(pm) && pm !== CLONE && pm !== VOID && !isSolid(pm) && Math.random() < 0.3) {
+                const fx = px + dx, fy = py + dy;
+                if (inBounds(fx, fy) && get(fx, fy) === EMPTY) {
+                  swap(px, py, fx, fy);
+                }
+              }
+            }
+          }
+          break;
+        // New structural material transitions
+        case GLASS:
+          if (t > 600 && Math.random() < 0.02) {
+            grid[i] = LAVA; temp[i] = 650;
+            integrityDirty = true; integrityTimer = Math.max(integrityTimer, 3);
+          }
+          break;
+        case BRICK:
+          if (t > 800 && Math.random() < 0.005) {
+            grid[i] = SAND;
+            integrityDirty = true; integrityTimer = Math.max(integrityTimer, 3);
+          }
+          break;
+        case CONCRETE:
+          if (t > 1000 && Math.random() < 0.003) {
+            grid[i] = SAND;
+            integrityDirty = true; integrityTimer = Math.max(integrityTimer, 3);
+          }
+          break;
+      }
+    }
+  }
+}
+
+// ==================== MATERIAL BEHAVIORS ====================
+
+function simPowder(x, y, mat) {
+  const below = get(x, y + 1);
+  if (canDisplace(mat, below)) {
+    swap(x, y, x, y + 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (canDisplace(mat, get(x + dir, y + 1))) swap(x, y, x + dir, y + 1);
+    else if (canDisplace(mat, get(x - dir, y + 1))) swap(x, y, x - dir, y + 1);
+  }
+
+  if (mat === SALT) {
+    for (const [dx, dy] of NEIGHBOR4) {
+      if (get(x + dx, y + dy) === WATER && Math.random() < 0.05) {
+        grid[idx(x, y)] = EMPTY;
+        temp[idx(x, y)] = ROOM_TEMP;
+        return;
+      }
+    }
+  }
+}
+
+function simLiquid(x, y, mat) {
+  const below = get(x, y + 1);
+  if (canDisplace(mat, below)) { swap(x, y, x, y + 1); return; }
+
+  const dir = Math.random() > 0.5 ? 1 : -1;
+  if (canDisplace(mat, get(x + dir, y + 1))) swap(x, y, x + dir, y + 1);
+  else if (canDisplace(mat, get(x - dir, y + 1))) swap(x, y, x - dir, y + 1);
+  else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+  else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+}
+
+function simAcid(x, y) {
+  const i = idx(x, y);
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+    if (neighbor === EMPTY || neighbor === ACID || neighbor === STONE || neighbor === LAVA || neighbor === CLONE || neighbor === VOID) continue;
+
+    if (neighbor === WATER) {
+      if (Math.random() < 0.08) {
+        grid[ni] = EMPTY; temp[ni] = ROOM_TEMP;
+        grid[i] = EMPTY; temp[i] = ROOM_TEMP;
+        return;
+      }
+      continue;
+    }
+
+    if (neighbor === METAL) {
+      if (Math.random() < 0.02) {
+        grid[ni] = GAS; life[ni] = 0; temp[ni] = 30;
+        grid[i] = SMOKE; life[i] = 0;
+        return;
+      }
+      continue;
+    }
+
+    // Acid vs structural materials
+    if (neighbor === GLASS) {
+      if (Math.random() < 0.05) {
+        grid[ni] = EMPTY; temp[ni] = ROOM_TEMP;
+        integrityDirty = true; integrityTimer = Math.max(integrityTimer, 5);
+        if (Math.random() < 0.3) { grid[i] = SMOKE; life[i] = 0; return; }
+      }
+      continue;
+    }
+    if (neighbor === BRICK) {
+      if (Math.random() < 0.015) {
+        grid[ni] = SAND; temp[ni] = ROOM_TEMP;
+        integrityDirty = true; integrityTimer = Math.max(integrityTimer, 5);
+        if (Math.random() < 0.4) { grid[i] = SMOKE; life[i] = 0; return; }
+      }
+      continue;
+    }
+    if (neighbor === CONCRETE) {
+      if (Math.random() < 0.008) {
+        grid[ni] = SAND; temp[ni] = ROOM_TEMP;
+        integrityDirty = true; integrityTimer = Math.max(integrityTimer, 5);
+        if (Math.random() < 0.5) { grid[i] = SMOKE; life[i] = 0; return; }
+      }
+      continue;
+    }
+
+    if (Math.random() < 0.03) {
+      grid[ni] = EMPTY; temp[ni] = ROOM_TEMP;
+      if (Math.random() < 0.4) {
+        grid[i] = Math.random() < 0.5 ? SMOKE : EMPTY;
+        life[i] = 0;
+        return;
+      }
+    }
+  }
+
+  const below = get(x, y + 1);
+  if (canDisplace(ACID, below)) { swap(x, y, x, y + 1); return; }
+  const dir = Math.random() > 0.5 ? 1 : -1;
+  if (get(x + dir, y + 1) === EMPTY) swap(x, y, x + dir, y + 1);
+  else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+  else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+}
+
+function simLava(x, y) {
+  const i = idx(x, y);
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+
+    if (neighbor === WATER) {
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 110;
+      temp[i] -= 100;
+      if (temp[i] < 400) { grid[i] = STONE; temp[i] = 350; return; }
+    } else if (neighbor === ICE) {
+      grid[ni] = WATER; temp[ni] = 20;
+      temp[i] -= 50;
+    } else if (neighbor === ACID) {
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 110;
+      temp[i] -= 30;
+    }
+  }
+
+  if (Math.random() < 0.3) return;
+
+  const below = get(x, y + 1);
+  if (canDisplace(LAVA, below)) { swap(x, y, x, y + 1); return; }
+
+  if (Math.random() < 0.3) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y + 1) === EMPTY) swap(x, y, x + dir, y + 1);
+    else if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+    else if (get(x - dir, y) === EMPTY) swap(x, y, x - dir, y);
+  }
+}
+
+function simFire(x, y) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > 20 + Math.random() * 30) {
+    const r = Math.random();
+    if (r < 0.35) { grid[i] = SMOKE; life[i] = 0; }
+    else if (r < 0.45) { grid[i] = EMBER; life[i] = 0; temp[i] = 350; }
+    else { grid[i] = EMPTY; life[i] = 0; temp[i] = ROOM_TEMP; }
+    return;
+  }
+
+  const dirs6 = [[0, -1], [0, 1], [-1, 0], [1, 0], [-1, -1], [1, -1]];
+  for (const [dx, dy] of dirs6) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+
+    if (neighbor === WATER) {
+      grid[i] = STEAM; life[i] = 0; temp[i] = 100;
+      grid[ni] = STEAM; life[ni] = 0; temp[ni] = 100;
+      return;
+    }
+
+    if (neighbor === GAS) {
+      grid[ni] = FIRE; life[ni] = 0; temp[ni] = 400;
+    }
+
+    if (neighbor === WOOD || neighbor === OIL || neighbor === PLANT || neighbor === GUNPOWDER) {
+      temp[ni] += 2;
+    }
+
+    if (dy === -1 && neighbor === EMPTY && Math.random() < 0.06) {
+      grid[ni] = SMOKE; life[ni] = 0;
+    }
+  }
+
+  if (Math.random() < 0.02) {
+    const edx = Math.random() > 0.5 ? 1 : -1;
+    if (inBounds(x + edx, y - 1) && get(x + edx, y - 1) === EMPTY) {
+      const ei = idx(x + edx, y - 1);
+      grid[ei] = EMBER; life[ei] = 0; temp[ei] = 350;
+    }
+  }
+
+  if (Math.random() < 0.35 && get(x, y - 1) === EMPTY) {
+    swap(x, y, x, y - 1);
+  } else if (Math.random() < 0.15) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y - 1) === EMPTY) swap(x, y, x + dir, y - 1);
+  }
+}
+
+function simGas(x, y, mat, maxLife) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > maxLife + Math.random() * maxLife * 0.5) {
+    grid[i] = EMPTY; life[i] = 0;
+    return;
+  }
+
+  if (mat === STEAM && isLiquid(get(x, y - 1)) && Math.random() < 0.3) {
+    swap(x, y, x, y - 1);
+    return;
+  }
+
+  if (mat === SMOKE) {
+    for (const [dx, dy] of NEIGHBOR4) {
+      if (get(x + dx, y + dy) === WATER) {
+        grid[i] = EMPTY; life[i] = 0;
+        return;
+      }
+    }
+  }
+
+  if (get(x, y - 1) === EMPTY) {
+    if (Math.random() < 0.7) swap(x, y, x, y - 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y - 1) === EMPTY) swap(x, y, x + dir, y - 1);
+    else if (get(x + dir, y) === EMPTY && Math.random() < 0.4) swap(x, y, x + dir, y);
+    else if (get(x - dir, y) === EMPTY && Math.random() < 0.4) swap(x, y, x - dir, y);
+  }
+}
+
+function simGasFlammable(x, y) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > 150 + Math.random() * 80) {
+    grid[i] = EMPTY; life[i] = 0;
+    return;
+  }
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const neighbor = get(nx, ny);
+    if (neighbor === FIRE || neighbor === EMBER || neighbor === LAVA) {
+      grid[i] = FIRE; life[i] = 0; temp[i] = 400;
+      return;
+    }
+  }
+
+  const above = get(x, y - 1);
+  if (above === EMPTY) {
+    if (Math.random() < 0.5) swap(x, y, x, y - 1);
+  } else {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y) === EMPTY && Math.random() < 0.5) swap(x, y, x + dir, y);
+    else if (get(x - dir, y) === EMPTY && Math.random() < 0.5) swap(x, y, x - dir, y);
+    else if (get(x + dir, y - 1) === EMPTY && Math.random() < 0.3) swap(x, y, x + dir, y - 1);
+  }
+}
+
+function simEmber(x, y) {
+  const i = idx(x, y);
+  life[i]++;
+
+  if (life[i] > 10 + Math.random() * 15) {
+    grid[i] = EMPTY; life[i] = 0; temp[i] = ROOM_TEMP;
+    return;
+  }
+
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const ni = idx(nx, ny);
+    const neighbor = grid[ni];
+    if (neighbor === WATER) {
+      grid[i] = STEAM; life[i] = 0; temp[i] = 100;
+      return;
+    }
+    if (neighbor === WOOD || neighbor === OIL || neighbor === PLANT) {
+      temp[ni] = Math.max(temp[ni], 250);
+    }
+    if (neighbor === GUNPOWDER) {
+      temp[ni] = Math.max(temp[ni], 110);
+    }
+    if (neighbor === GAS) {
+      grid[ni] = FIRE; life[ni] = 0; temp[ni] = 400;
+    }
+  }
+
+  const r = Math.random();
+  if (r < 0.4) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x, y - 1) === EMPTY) swap(x, y, x, y - 1);
+    else if (get(x + dir, y - 1) === EMPTY) swap(x, y, x + dir, y - 1);
+  } else if (r < 0.65) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    if (get(x + dir, y) === EMPTY) swap(x, y, x + dir, y);
+  } else {
+    if (get(x, y + 1) === EMPTY) swap(x, y, x, y + 1);
+  }
+}
+
+function simPlant(x, y) {
+  let waterNear = false;
+  let waterCount = 0;
+
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      if (get(x + dx, y + dy) === WATER) { waterNear = true; waterCount++; }
+    }
+  }
+
+  if (!waterNear) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (get(x + dx, y - 2) === WATER || get(x + dx, y + 2) === WATER) waterNear = true;
+    }
+  }
+
+  const growRate = waterNear ? 0.008 + waterCount * 0.004 : 0.001;
+
+  if (Math.random() < growRate) {
+    const growDirs = waterNear
+      ? [[0, -1], [-1, -1], [1, -1], [-1, 0], [1, 0], [0, 1]]
+      : [[0, 1], [-1, 0], [1, 0]];
+
+    for (const [dx, dy] of growDirs) {
+      const nx = x + dx, ny = y + dy;
+      if (inBounds(nx, ny) && get(nx, ny) === EMPTY) {
+        set(nx, ny, PLANT, temp[idx(x, y)]);
+        for (const [wx, wy] of NEIGHBOR4) {
+          if (get(x + wx, y + wy) === WATER && Math.random() < 0.3) {
+            set(x + wx, y + wy, EMPTY, ROOM_TEMP);
+            break;
+          }
+        }
+        return;
+      }
+    }
+  }
+}
+
+function simClone(x, y) {
+  let sourceMat = EMPTY;
+  let sourceTemp = ROOM_TEMP;
+
+  for (const [dx, dy] of [[0, -1], [-1, 0], [1, 0], [0, 1]]) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const m = get(nx, ny);
+    if (m !== EMPTY && m !== CLONE && m !== VOID) {
+      sourceMat = m; sourceTemp = temp[idx(nx, ny)]; break;
+    }
+  }
+
+  if (sourceMat === EMPTY) return;
+
+  for (const [dx, dy] of [[0, 1], [-1, 0], [1, 0], [0, -1]]) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny) || get(nx, ny) !== EMPTY) continue;
+    if (Math.random() < 0.1) {
+      const ni = idx(nx, ny);
+      grid[ni] = sourceMat; life[ni] = 0;
+      if (sourceMat === FIRE) temp[ni] = 500;
+      else if (sourceMat === LAVA) temp[ni] = 800;
+      else if (sourceMat === ICE) temp[ni] = -10;
+      else if (sourceMat === EMBER) temp[ni] = 350;
+      else temp[ni] = sourceTemp;
+      return;
+    }
+  }
+}
+
+function simVoid(x, y) {
+  for (const [dx, dy] of NEIGHBOR4) {
+    const nx = x + dx, ny = y + dy;
+    if (!inBounds(nx, ny)) continue;
+    const neighbor = get(nx, ny);
+    if (neighbor !== EMPTY && neighbor !== VOID && neighbor !== CLONE) {
+      const ni = idx(nx, ny);
+      grid[ni] = EMPTY; temp[ni] = ROOM_TEMP; life[ni] = 0;
+    }
+  }
+}
+
+// ==================== MAIN SIMULATION ====================
+
+function simulate() {
+  updated.fill(0);
+  simulateThermal();
+  checkTransitions();
+
+  const leftToRight = Math.random() > 0.5;
+  for (let y = H - 1; y >= 0; y--) {
+    const startX = leftToRight ? 0 : W - 1;
+    const endX = leftToRight ? W : -1;
+    const stepX = leftToRight ? 1 : -1;
+
+    for (let x = startX; x !== endX; x += stepX) {
+      const i = idx(x, y);
+      if (updated[i]) continue;
+      const mat = grid[i];
+      if (mat === EMPTY) continue;
+
+      if (isPowder(mat)) simPowder(x, y, mat);
+      else if (mat === ACID) simAcid(x, y);
+      else if (mat === LAVA) simLava(x, y);
+      else if (isLiquid(mat)) simLiquid(x, y, mat);
+      else if (mat === FIRE) simFire(x, y);
+      else if (mat === STEAM) simGas(x, y, STEAM, 80);
+      else if (mat === SMOKE) simGas(x, y, SMOKE, 60);
+      else if (mat === GAS) simGasFlammable(x, y);
+      else if (mat === EMBER) simEmber(x, y);
+      else if (mat === PLANT) simPlant(x, y);
+      else if (mat === NAPALM) simNapalm(x, y);
+      else if (mat === CLONE) simClone(x, y);
+      else if (mat === VOID) simVoid(x, y);
+      // CONCRETE, GLASS, BRICK, STONE, WOOD, METAL, ICE: static, no sim needed
+    }
+  }
+
+  // Update warheads
+  updateWarheads();
+
+  // Update falling chunks
+  updateChunks();
+
+  // Structural integrity check (delayed for cascade drama)
+  if (integrityDirty) {
+    if (integrityTimer > 0) {
+      integrityTimer--;
+    } else {
+      integrityDirty = false;
+      checkIntegrity();
+    }
+  }
+}
+
+// ==================== RENDERING ====================
+
+function render() {
+  // Grid
+  for (let i = 0; i < W * H; i++) {
+    let c;
+    if (showStress) {
+      c = stressHeatmap(weightBuf[i], grid[i]);
+    } else if (showTemp) {
+      c = tempHeatmap(temp[i]);
+    } else {
+      c = matColor(grid[i]);
+      const mat = grid[i];
+      if (mat !== EMPTY && mat !== FIRE && mat !== LAVA && mat !== CLONE && mat !== VOID && mat !== EMBER) {
+        c = thermalTint(c[0], c[1], c[2], temp[i]);
+      }
+    }
+    pixels[i] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+  }
+
+  // Falling chunks (render on top of grid)
+  if (!showTemp) {
+    for (const chunk of chunks) {
+      for (const p of chunk.pixels) {
+        const wx = chunk.x + p.rx;
+        const wy = chunk.y + p.ry;
+        if (wx < 0 || wx >= W || wy < 0 || wy >= H) continue;
+        const c = matColor(p.mat);
+        pixels[wy * W + wx] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+      }
+    }
+  }
+
+  // Warheads
+  for (const w of warheads) {
+    const gx = Math.round(w.x), gy = Math.round(w.y);
+
+    // Color based on warhead type
+    let bodyR, bodyG, bodyB, trailR, trailG, trailB;
+    switch (w.type) {
+      case WH_MORTAR: bodyR=255; bodyG=50; bodyB=30; trailR=255; trailG=150; trailB=30; break;
+      case WH_CLUSTER: bodyR=255; bodyG=180; bodyB=0; trailR=255; trailG=200; trailB=60; break;
+      case WH_NAPALM: bodyR=255; bodyG=100; bodyB=0; trailR=255; trailG=80; trailB=10; break;
+      case WH_BUNKER: bodyR=180; bodyG=180; bodyB=190; trailR=150; trailG=150; trailB=170; break;
+      case -1: bodyR=255; bodyG=220; bodyB=80; trailR=255; trailG=180; trailB=40; break; // submunition
+      default: bodyR=255; bodyG=50; bodyB=30; trailR=255; trailG=150; trailB=30;
+    }
+
+    // Body
+    const bodyW = w.type === WH_BUNKER ? 1 : (w.type === -1 ? 0 : 1);
+    const bodyH = w.type === WH_BUNKER ? 2 : (w.type === -1 ? 0 : 1);
+    for (let dy = -bodyH; dy <= 0; dy++) {
+      for (let dx = -bodyW; dx <= bodyW; dx++) {
+        const px = gx + dx, py = gy + dy;
+        if (px >= 0 && px < W && py >= 0 && py < H) {
+          pixels[py * W + px] = (255 << 24) | (bodyB << 16) | (bodyG << 8) | bodyR;
+        }
+      }
+    }
+
+    // Trail (bunker buster has longer trail when penetrating)
+    const trailLen = w.penetrating ? 4 : (w.type === -1 ? 5 : 10);
+    for (let t = 1; t < trailLen; t++) {
+      const ty = gy - t - bodyH;
+      const spread = Math.random() > 0.5 ? 1 : -1;
+      const tx = gx + (t > 3 ? (Math.random() > 0.5 ? spread : 0) : 0);
+      if (tx >= 0 && tx < W && ty >= 0 && ty < H) {
+        const a = 1 - t / trailLen;
+        const r = trailR * a | 0;
+        const g = (trailG + Math.random() * 40) * a | 0;
+        const b = (trailB + Math.random() * 20) * a | 0;
+        pixels[ty * W + tx] = (255 << 24) | (b << 16) | (g << 8) | r;
+      }
+    }
+  }
+
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+
+  // Warhead mode indicator
+  if (warheadMode) {
+    const whColor = WH_BTN_COLORS[warheadType];
+    const whAlpha = '99';
+    ctx.strokeStyle = whColor + whAlpha;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.strokeRect(1, 1, W * SCALE - 2, H * SCALE - 2);
+    ctx.setLineDash([]);
+
+    const sx = mouseX * SCALE, sy = mouseY * SCALE;
+    ctx.strokeStyle = whColor + '88';
+    ctx.lineWidth = 1;
+
+    if (warheadType === WH_RAILGUN) {
+      // Railgun: vertical line showing the trace path
+      ctx.beginPath();
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx, H * SCALE);
+      ctx.stroke();
+      // Small crosshair at cursor
+      ctx.beginPath();
+      ctx.moveTo(sx - 6, sy); ctx.lineTo(sx + 6, sy);
+      ctx.stroke();
+    } else {
+      // Standard crosshair
+      ctx.beginPath();
+      ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy);
+      ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8);
+      ctx.stroke();
+
+      // Cluster bomb: show spread indicator
+      if (warheadType === WH_CLUSTER) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, 12, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+// ==================== INPUT ====================
+
+function paint() {
+  const r = brushSize;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const px = mouseX + dx, py = mouseY + dy;
+      if (!inBounds(px, py)) continue;
+      const pi = idx(px, py);
+      if (material === EMPTY) {
+        if (isStructural(grid[pi])) { integrityDirty = true; integrityTimer = Math.max(integrityTimer, 2); }
+        grid[pi] = EMPTY; life[pi] = 0; temp[pi] = ROOM_TEMP;
+      } else if (grid[pi] === EMPTY) {
+        if (Math.random() < 0.7) {
+          grid[pi] = material; life[pi] = 0;
+          if (material === FIRE) temp[pi] = 500;
+          else if (material === LAVA) temp[pi] = 800;
+          else if (material === ICE) temp[pi] = -10;
+          else if (material === EMBER) temp[pi] = 350;
+          else temp[pi] = ROOM_TEMP;
+        }
+      }
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+
+  if (warheadMode) {
+    launchWarhead(mouseX, mouseY);
+  } else {
+    mouseDown = true;
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mouseup', () => mouseDown = false);
+canvas.addEventListener('mouseleave', () => mouseDown = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(20, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = `Brush: ${brushSize}`;
+}, { passive: false });
+
+const keyMap = {
+  '1': SAND, '2': WATER, '3': STONE, '4': FIRE, '5': WOOD,
+  '6': OIL, '7': GUNPOWDER, '8': ICE, '9': ACID, '0': EMPTY,
+  'q': LAVA, 'w': METAL, 'e': PLANT, 'r': SALT, 't': SMOKE,
+  'y': GAS, 'u': CLONE, 'i': VOID, 'o': EMBER,
+  'a': CONCRETE, 's': GLASS, 'd': BRICK, 'z': NAPALM,
+};
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (keyMap[k] !== undefined) { material = keyMap[k]; warheadMode = false; updateActiveBtn(); updateModeLabel(); }
+  if (k === 'c' && !e.ctrlKey) { grid.fill(0); life.fill(0); temp.fill(ROOM_TEMP); chunks.length = 0; warheads.length = 0; }
+  if (k === ' ') { e.preventDefault(); paused = !paused; updateModeLabel(); }
+  if (k === 'v') { showTemp = !showTemp; if (showTemp) showStress = false; updateModeLabel(); }
+  if (k === 'x') { showStress = !showStress; if (showStress) showTemp = false; updateModeLabel(); }
+  if (k === 'm') {
+    if (!warheadMode) { warheadMode = true; warheadType = WH_NAPALM; }
+    else {
+      warheadType = (warheadType + 1) % WH_COUNT;
+      if (warheadType === WH_NAPALM) { warheadMode = false; } // full cycle → exit
+    }
+    updateModeLabel(); updateActiveBtn();
+  }
+  if (k === 'g') { generateCity(); }
+});
+
+function updateActiveBtn() {
+  document.querySelectorAll('.mat-btn').forEach(b => {
+    b.classList.remove('active');
+    b.classList.remove('warhead-active');
+  });
+  if (warheadMode) {
+    const wb = document.querySelector(`[data-mat="wh_${warheadType}"]`);
+    if (wb) wb.classList.add('warhead-active');
+  } else {
+    const t = document.querySelector(`[data-mat="${material}"]`);
+    if (t) t.classList.add('active');
+  }
+}
+
+function updateModeLabel() {
+  const p = [];
+  if (paused) p.push('PAUSED');
+  if (showTemp) p.push('THERMAL VIEW');
+  if (showStress) p.push('STRESS VIEW');
+  if (warheadMode) p.push(`WARHEAD: ${WH_NAMES[warheadType].toUpperCase()}`);
+  document.getElementById('mode-label').textContent = p.join(' · ');
+}
+
+// ==================== UI SETUP ====================
+
+const BTN_COLORS = {
+  [SAND]: '#d4b464', [WATER]: '#2850c8', [STONE]: '#787882', [FIRE]: '#ff6420',
+  [WOOD]: '#64411e', [OIL]: '#3c2846', [GUNPOWDER]: '#505050', [STEAM]: '#b4b4dc',
+  [ACID]: '#1edc32', [LAVA]: '#c83c0a', [ICE]: '#b4d6fa', [SMOKE]: '#5a5a5f',
+  [PLANT]: '#1ea028', [SALT]: '#dcdcf0', [METAL]: '#aaafb4',
+  [GAS]: '#8cb420', [CLONE]: '#32c8d2', [VOID]: '#4a0060', [EMBER]: '#ffaa22',
+  [CONCRETE]: '#a0a09b', [GLASS]: '#b0d0e8', [BRICK]: '#9b4630',
+  [NAPALM]: '#e05000',
+  [EMPTY]: null,
+};
+
+const WH_BTN_COLORS = ['#f44', '#ff8800', '#ff4400', '#889', '#44ffee'];
+
+const toolbar = document.getElementById('toolbar');
+const btnDefs = [
+  [SAND, 'Sand', '1'], [WATER, 'Water', '2'], [STONE, 'Stone', '3'],
+  [ICE, 'Ice', '8'], [SALT, 'Salt', 'R'], [WOOD, 'Wood', '5'],
+  [PLANT, 'Plant', 'E'], null,
+  [CONCRETE, 'Cncrt', 'A'], [BRICK, 'Brick', 'D'], [GLASS, 'Glass', 'S'],
+  [METAL, 'Metal', 'W'], null,
+  [OIL, 'Oil', '6'], [GUNPOWDER, 'Pwdr', '7'],
+  [ACID, 'Acid', '9'], [LAVA, 'Lava', 'Q'], [NAPALM, 'Nplm', 'Z'], null,
+  [FIRE, 'Fire', '4'], [GAS, 'Gas', 'Y'], [SMOKE, 'Smoke', 'T'],
+  [EMBER, 'Ember', 'O'], null,
+  [CLONE, 'Clone', 'U'], [VOID, 'Void', 'I'], null,
+  [EMPTY, 'Erase', '0'],
+];
+
+btnDefs.forEach(def => {
+  if (def === null) {
+    const sep = document.createElement('div');
+    sep.className = 'sep';
+    toolbar.appendChild(sep);
+    return;
+  }
+  const [id, name, key] = def;
+  const btn = document.createElement('button');
+  btn.className = 'btn mat-btn' + (id === material ? ' active' : '');
+  btn.dataset.mat = id;
+  btn.innerHTML = `${name}<span class="key">${key}</span>`;
+  if (BTN_COLORS[id]) {
+    btn.style.borderBottomColor = BTN_COLORS[id];
+    btn.style.borderBottomWidth = '3px';
+  }
+  btn.addEventListener('click', () => { material = id; warheadMode = false; updateActiveBtn(); updateModeLabel(); });
+  toolbar.appendChild(btn);
+});
+
+// Warhead type buttons
+for (let wi = 0; wi < WH_COUNT; wi++) {
+  const wBtn = document.createElement('button');
+  wBtn.className = 'btn mat-btn';
+  wBtn.dataset.mat = 'wh_' + wi;
+  const shortNames = ['Mortar', 'Cluster', 'Napalm', 'Bunker', 'Rail'];
+  // Cycle order: napalm(2)→bunker(3)→railgun(4)→mortar(0)→cluster(1)
+  const cyclePos = [4, 5, 1, 2, 3]; // press count for each warhead type index
+  wBtn.innerHTML = `${shortNames[wi]}<span class="key">M${cyclePos[wi] > 1 ? '×' + cyclePos[wi] : ''}</span>`;
+  wBtn.style.borderBottomColor = WH_BTN_COLORS[wi];
+  wBtn.style.borderBottomWidth = '3px';
+  ((type) => {
+    wBtn.addEventListener('click', () => {
+      if (warheadMode && warheadType === type) {
+        warheadMode = false;
+      } else {
+        warheadMode = true;
+        warheadType = type;
+      }
+      updateActiveBtn();
+      updateModeLabel();
+    });
+  })(wi);
+  toolbar.appendChild(wBtn);
+}
+
+// Separator
+const sep2 = document.createElement('div');
+sep2.className = 'sep';
+toolbar.appendChild(sep2);
+
+// City generator button
+const cityBtn = document.createElement('button');
+cityBtn.className = 'btn';
+cityBtn.innerHTML = 'City<span class="key">G</span>';
+cityBtn.style.borderColor = '#48c';
+cityBtn.addEventListener('click', () => generateCity());
+toolbar.appendChild(cityBtn);
+
+// Clear button
+const clearBtn = document.createElement('button');
+clearBtn.className = 'btn';
+clearBtn.innerHTML = 'Clear<span class="key">C</span>';
+clearBtn.style.borderColor = '#833';
+clearBtn.addEventListener('click', () => { grid.fill(0); life.fill(0); temp.fill(ROOM_TEMP); chunks.length = 0; warheads.length = 0; });
+toolbar.appendChild(clearBtn);
+
+// ==================== GAME LOOP ====================
+
+function loop() {
+  if (mouseDown && !warheadMode) paint();
+  if (!paused) simulate();
+  render();
+
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    currentFps = frameCount;
+    frameCount = 0;
+    lastFpsTime = now;
+    const fpsEl = document.getElementById('fps');
+    fpsEl.textContent = `${currentFps} fps`;
+    fpsEl.className = currentFps < 30 ? 'warn' : '';
+
+    let count = 0;
+    for (let i = 0; i < W * H; i++) { if (grid[i] !== EMPTY) count++; }
+    let info = `${count} particles`;
+    if (chunks.length > 0) info += ` · ${chunks.length} falling`;
+    document.getElementById('particles').textContent = info;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>

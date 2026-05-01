@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bodypipe</title>
+<style>
+* { margin: 0; padding: 0; }
+body { background: #f5f0e8; overflow: hidden; font-family: monospace; }
+#canvas { display: block; width: 100vw; height: 100vh; }
+#video { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0.001; pointer-events: none; z-index: -1; }
+#overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px;
+  pointer-events: none; z-index: 10;
+}
+#startBtn {
+  pointer-events: auto; padding: 14px 28px; font-size: 15px;
+  font-family: monospace; cursor: pointer; background: none;
+  border: 1px solid #555; color: #444; border-radius: 4px;
+  transition: all 0.2s;
+}
+#startBtn:hover { background: rgba(0,0,0,0.04); border-color: #333; }
+#status { font-size: 11px; color: #999; pointer-events: none; }
+#debug {
+  position: fixed; top: 8px; left: 8px; font-size: 11px;
+  color: #999; z-index: 20; display: none;
+}
+#hint {
+  position: fixed; bottom: 12px; right: 12px; font-size: 10px;
+  color: #bbb; z-index: 20;
+}
+#tuner {
+  position: fixed; top: 8px; right: 8px; z-index: 30;
+  background: rgba(0,0,0,0.82); color: #ccc; font-family: monospace;
+  font-size: 11px; padding: 10px 14px; border-radius: 6px;
+  display: none; max-height: 90vh; overflow-y: auto; min-width: 260px;
+}
+#tuner h3 { margin: 0 0 8px; color: #eee; font-size: 12px; }
+#tuner label { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+#tuner input[type=range] { flex: 1; height: 14px; accent-color: #888; }
+#tuner .val { min-width: 42px; text-align: right; color: #aaa; font-size: 10px; }
+#tuner .section { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.1); }
+#tuner .section h3 { margin: 0 0 8px; color: #eee; font-size: 12px; }
+#tuner input[type=color] { width: 32px; height: 20px; border: 1px solid #555; border-radius: 3px; background: none; cursor: pointer; padding: 0; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<video id="video" playsinline muted></video>
+<div id="overlay">
+  <div id="status"></div>
+  <button id="startBtn">start camera</button>
+  <label id="fileLabel" style="pointer-events:auto;padding:14px 28px;font-size:15px;font-family:monospace;cursor:pointer;background:none;border:1px solid #555;color:#444;border-radius:4px;transition:all 0.2s;display:inline-block;">
+    load video file
+    <input type="file" id="fileInput" accept="video/*" style="position:absolute;opacity:0;width:0;height:0;overflow:hidden;">
+  </label>
+</div>
+<div id="debug"></div>
+<div id="hint">b: silhouette · d: debug · v: video · r: respawn · t: tuner</div>
+<div id="tuner"></div>
+
+<script type="module">
+
+// ====================== MODE ======================
+// 'flock' = idle fish tank (boids), 'vessel' = water inside body silhouette
+var mode = 'flock';
+
+// ====================== FLOCK CONFIG ======================
+const FLOCK = {
+  COUNT: 400,
+  CELL: 60,
+  SEP_RADIUS: 18,
+  SEP_FORCE: 1.8,
+  ALI_FORCE: 1.0,
+  COH_FORCE: 0.6,
+  MAX_SPEED: 2.5,
+  MIN_SPEED: 0.5,
+  MAX_STEER: 0.05,
+  EDGE_MARGIN: 100,
+  EDGE_FORCE: 0.05,
+  WANDER: 0.015,
+  TRAIL_ALPHA: 0.02,
+};
+
+// ====================== VESSEL CONFIG ======================
+// CONTAINER MODEL: The person's silhouette is a container (like a bag of sand).
+// Particles live inside the silhouette. Gravity pulls them down. The boundary
+// acts as a hard wall. When the person moves, the wall moves and pushes particles.
+// Particles slosh, settle, and pile up inside the body shape.
+let VESSEL = {
+  COUNT: 2500,
+  CELL: 30,              // spatial hash cell
+  SPREAD_RADIUS: 24,     // range for pressure repulsion
+  SPREAD_FORCE: 0.06,    // gentle push toward even distribution
+  OVERLAP_R: 4.0,        // hard minimum spacing
+  OVERLAP_PUSH: 0.35,    // position correction per overlap
+  MAX_SPEED: 15,
+  SPRING_K: 0.3,         // spring stiffness — pulls escaped particles back into mask
+  SPRING_DAMP: 0.85,     // spring velocity damping — lower = more oscillation
+  PLATFORM: 0.95,        // body tracking — particles ride with centroid movement
+  GRAVITY: 0.04,         // slight downward pull for mass feel
+  FIELD_W: 160,
+  FIELD_H: 120,
+  BODY_THRESH: 0.45,
+  TRAIL_ALPHA: 0.06,
+};
+
+// ====================== RENDER CONSTANTS ======================
+let INK = [25, 20, 40];
+let BG_RGB = [245, 240, 232];
+let BG = `rgba(${BG_RGB[0]}, ${BG_RGB[1]}, ${BG_RGB[2]},`;
+let DOT_R = 1.8;
+let MARK_MIN = 1.5;
+let MARK_SCALE = 2.5;
+let MARK_W = 2.0;
+let DOT_THRESH = 1.0;
+
+// ====================== CANVAS ======================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('video');
+var W, H;
+
+// ====================== PARTICLE STATE ======================
+const MAX = 5000;
+const px = new Float32Array(MAX);
+const py = new Float32Array(MAX);
+const pvx = new Float32Array(MAX);
+const pvy = new Float32Array(MAX);
+const pspeed = new Float32Array(MAX);
+// Spring-to-surface: each particle has a home position on the body
+const homeX = new Float32Array(MAX);
+const homeY = new Float32Array(MAX);
+const prevHomeX = new Float32Array(MAX);
+const prevHomeY = new Float32Array(MAX);
+var count = 0;
+
+function spawn(x, y, vx, vy) {
+  if (count >= MAX) return;
+  px[count] = x; py[count] = y;
+  pvx[count] = vx; pvy[count] = vy;
+  homeX[count] = x; homeY[count] = y;
+  count++;
+}
+
+// ====================== SPATIAL HASH ======================
+var cellSize = FLOCK.CELL;
+var gridW = 1, gridH = 1;
+var gridHead = new Int32Array(1);
+var gridNext = new Int32Array(MAX);
+
+function rebuildGrid() {
+  if (!W) return;
+  gridW = Math.ceil(W / cellSize) + 1;
+  gridH = Math.ceil(H / cellSize) + 1;
+  gridHead = new Int32Array(gridW * gridH);
+}
+
+function hashReset() { gridHead.fill(-1); }
+
+function hashInsert(i) {
+  const cx = Math.max(0, Math.min(gridW - 1, (px[i] / cellSize) | 0));
+  const cy = Math.max(0, Math.min(gridH - 1, (py[i] / cellSize) | 0));
+  const key = cy * gridW + cx;
+  gridNext[i] = gridHead[key];
+  gridHead[key] = i;
+}
+
+// ====================== RESIZE ======================
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+  ctx.fillStyle = BG + '1)';
+  ctx.fillRect(0, 0, W, H);
+  rebuildGrid();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ====================== FLOCK: SPAWN ======================
+
+function spawnFlock() {
+  count = 0;
+  const clusters = 5;
+  const per = Math.floor(FLOCK.COUNT / clusters);
+  for (let c = 0; c < clusters; c++) {
+    const cx = W * 0.15 + Math.random() * W * 0.7;
+    const cy = H * 0.15 + Math.random() * H * 0.7;
+    const angle = Math.random() * Math.PI * 2;
+    const spd = 1 + Math.random() * 1.5;
+    for (let i = 0; i < per; i++) {
+      const x = cx + (Math.random() - 0.5) * 80;
+      const y = cy + (Math.random() - 0.5) * 80;
+      const a = angle + (Math.random() - 0.5) * 0.8;
+      spawn(x, y, Math.cos(a) * spd, Math.sin(a) * spd);
+    }
+  }
+}
+
+// ====================== FLOCK: SIMULATE ======================
+
+function simFlock(dt) {
+  hashReset();
+  for (let i = 0; i < count; i++) hashInsert(i);
+
+  const sepR2 = FLOCK.SEP_RADIUS * FLOCK.SEP_RADIUS;
+  const perR2 = FLOCK.CELL * FLOCK.CELL;
+
+  for (let i = 0; i < count; i++) {
+    let sepX = 0, sepY = 0, sepN = 0;
+    let aliX = 0, aliY = 0, aliN = 0;
+    let cohX = 0, cohY = 0, cohN = 0;
+
+    const ci = (px[i] / cellSize) | 0;
+    const cj = (py[i] / cellSize) | 0;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      const gy = cj + dy;
+      if (gy < 0 || gy >= gridH) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const gx = ci + dx;
+        if (gx < 0 || gx >= gridW) continue;
+        let j = gridHead[gy * gridW + gx];
+        while (j >= 0) {
+          if (j !== i) {
+            const ddx = px[j] - px[i], ddy = py[j] - py[i];
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < sepR2 && d2 > 0.01) {
+              const d = Math.sqrt(d2);
+              sepX -= ddx / d; sepY -= ddy / d; sepN++;
+            }
+            if (d2 < perR2) {
+              aliX += pvx[j]; aliY += pvy[j]; aliN++;
+              cohX += px[j]; cohY += py[j]; cohN++;
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+
+    let ax = 0, ay = 0;
+
+    // Separation — avoid crowding
+    if (sepN > 0) {
+      const len = Math.sqrt(sepX * sepX + sepY * sepY) + 0.001;
+      ax += (sepX / len) * FLOCK.SEP_FORCE;
+      ay += (sepY / len) * FLOCK.SEP_FORCE;
+    }
+
+    // Alignment — steer toward average heading
+    if (aliN > 0) {
+      aliX /= aliN; aliY /= aliN;
+      const len = Math.sqrt(aliX * aliX + aliY * aliY) + 0.001;
+      ax += ((aliX / len) * FLOCK.MAX_SPEED - pvx[i]) * FLOCK.ALI_FORCE * 0.08;
+      ay += ((aliY / len) * FLOCK.MAX_SPEED - pvy[i]) * FLOCK.ALI_FORCE * 0.08;
+    }
+
+    // Cohesion — steer toward average position
+    if (cohN > 0) {
+      cohX /= cohN; cohY /= cohN;
+      const cdx = cohX - px[i], cdy = cohY - py[i];
+      const len = Math.sqrt(cdx * cdx + cdy * cdy) + 0.001;
+      ax += (cdx / len) * FLOCK.COH_FORCE * 0.02;
+      ay += (cdy / len) * FLOCK.COH_FORCE * 0.02;
+    }
+
+    // Soft edge avoidance
+    const m = FLOCK.EDGE_MARGIN;
+    if (px[i] < m) ax += FLOCK.EDGE_FORCE * (1 - px[i] / m);
+    if (px[i] > W - m) ax -= FLOCK.EDGE_FORCE * (1 - (W - px[i]) / m);
+    if (py[i] < m) ay += FLOCK.EDGE_FORCE * (1 - py[i] / m);
+    if (py[i] > H - m) ay -= FLOCK.EDGE_FORCE * (1 - (H - py[i]) / m);
+
+    // Gentle wander
+    ax += (Math.random() - 0.5) * FLOCK.WANDER;
+    ay += (Math.random() - 0.5) * FLOCK.WANDER;
+
+    // Clamp steering force
+    const aMag = Math.sqrt(ax * ax + ay * ay);
+    if (aMag > FLOCK.MAX_STEER) {
+      ax = ax / aMag * FLOCK.MAX_STEER;
+      ay = ay / aMag * FLOCK.MAX_STEER;
+    }
+
+    pvx[i] += ax; pvy[i] += ay;
+
+    // Speed limits
+    let spd = Math.sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i]);
+    if (spd > FLOCK.MAX_SPEED) {
+      pvx[i] *= FLOCK.MAX_SPEED / spd;
+      pvy[i] *= FLOCK.MAX_SPEED / spd;
+    }
+    if (spd > 0.01 && spd < FLOCK.MIN_SPEED) {
+      pvx[i] *= FLOCK.MIN_SPEED / spd;
+      pvy[i] *= FLOCK.MIN_SPEED / spd;
+    }
+
+    px[i] += pvx[i] * dt;
+    py[i] += pvy[i] * dt;
+
+    // Soft wrap at screen edges
+    if (px[i] < -30) px[i] += W + 60;
+    if (px[i] > W + 30) px[i] -= W + 60;
+    if (py[i] < -30) py[i] += H + 60;
+    if (py[i] > H + 30) py[i] -= H + 60;
+  }
+}
+
+// ====================== VESSEL: MASK FIELD ======================
+
+const fieldMask = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const fieldGX = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const fieldGY = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+var hasMask = false;
+var bodyDetected = false;
+
+// Body centroid tracking for inertia
+var bodyCX = 0, bodyCY = 0;
+var bodyVelX = 0, bodyVelY = 0;
+var bodyAccX = 0, bodyAccY = 0;
+var prevBodyVX = 0, prevBodyVY = 0;
+var centroidInit = false;
+
+var videoFileMode = false;
+
+// Optical flow — dense velocity field from actual video pixels
+const flowCanvas = document.createElement('canvas');
+flowCanvas.width = VESSEL.FIELD_W;
+flowCanvas.height = VESSEL.FIELD_H;
+const flowCtx2 = flowCanvas.getContext('2d', { willReadFrequently: true });
+const prevGray = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const currGray = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const flowU = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const flowV = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const _Ix = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const _Iy = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+const _It = new Float32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+var hasFlow = false;
+var flowFrameCount = 0;
+var lastFlowTime = 0;
+var flowDt = 50;
+
+const MASK_BLEND = 0.15;  // how fast mask updates — lower = smoother, less edge jitter
+var maskInited = false;
+
+function updateMask(maskData, mw, mh) {
+  const FW = VESSEL.FIELD_W, FH = VESSEL.FIELD_H;
+  const scaleX = mw / FW, scaleY = mh / FH;
+
+  // Sample mask into field (mirror for webcam, direct for video file)
+  // Blend with previous frame to suppress MediaPipe segmentation noise
+  for (let fy = 0; fy < FH; fy++) {
+    for (let fx = 0; fx < FW; fx++) {
+      const mx = videoFileMode ? Math.floor(fx * scaleX) : mw - 1 - Math.floor(fx * scaleX);
+      const my = Math.floor(fy * scaleY);
+      const raw = maskData[my * mw + mx];
+      const idx = fy * FW + fx;
+      fieldMask[idx] = maskInited
+        ? fieldMask[idx] * (1 - MASK_BLEND) + raw * MASK_BLEND
+        : raw;
+    }
+  }
+  maskInited = true;
+
+  // Gradient field — central differences, points toward body interior
+  for (let y = 1; y < FH - 1; y++) {
+    for (let x = 1; x < FW - 1; x++) {
+      const i = y * FW + x;
+      fieldGX[i] = (fieldMask[i + 1] - fieldMask[i - 1]) * 0.5;
+      fieldGY[i] = (fieldMask[i + FW] - fieldMask[i - FW]) * 0.5;
+    }
+  }
+
+  // Body centroid, velocity, acceleration
+  let sx = 0, sy = 0, sw = 0;
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      const w = fieldMask[y * FW + x];
+      if (w > VESSEL.BODY_THRESH) { sx += x * w; sy += y * w; sw += w; }
+    }
+  }
+
+  if (sw > 10) {
+    const prevCX = bodyCX, prevCY = bodyCY;
+    bodyCX = (sx / sw) / FW * W;
+    bodyCY = (sy / sw) / FH * H;
+
+    if (centroidInit) {
+      prevBodyVX = bodyVelX;
+      prevBodyVY = bodyVelY;
+      // Smoothed velocity
+      const rawVX = bodyCX - prevCX, rawVY = bodyCY - prevCY;
+      bodyVelX = bodyVelX * 0.3 + rawVX * 0.7;
+      bodyVelY = bodyVelY * 0.3 + rawVY * 0.7;
+      const maxV = 30;
+      bodyVelX = Math.max(-maxV, Math.min(maxV, bodyVelX));
+      bodyVelY = Math.max(-maxV, Math.min(maxV, bodyVelY));
+      // Smoothed acceleration (derivative of velocity)
+      bodyAccX = bodyAccX * 0.4 + (bodyVelX - prevBodyVX) * 0.6;
+      bodyAccY = bodyAccY * 0.4 + (bodyVelY - prevBodyVY) * 0.6;
+    } else {
+      centroidInit = true;
+    }
+
+    if (!bodyDetected) {
+      bodyDetected = true;
+      transitionToVessel();
+    }
+  }
+
+  hasMask = true;
+}
+
+function sampleField(arr, fx, fy) {
+  const FW = VESSEL.FIELD_W;
+  const ix = Math.floor(fx), iy = Math.floor(fy);
+  if (ix < 0 || ix >= FW - 1 || iy < 0 || iy >= VESSEL.FIELD_H - 1) return 0;
+  const dx = fx - ix, dy = fy - iy;
+  const i = iy * FW + ix;
+  return arr[i] * (1 - dx) * (1 - dy)
+       + arr[i + 1] * dx * (1 - dy)
+       + arr[i + FW] * (1 - dx) * dy
+       + arr[i + FW + 1] * dx * dy;
+}
+
+// ====================== OPTICAL FLOW ======================
+
+function captureAndComputeFlow() {
+  const FW = VESSEL.FIELD_W, FH = VESSEL.FIELD_H;
+
+  // Swap: current becomes previous
+  prevGray.set(currGray);
+
+  // Draw video to small offscreen canvas (mirrored for webcam)
+  flowCtx2.save();
+  if (!videoFileMode) {
+    flowCtx2.scale(-1, 1);
+    flowCtx2.drawImage(video, -FW, 0, FW, FH);
+  } else {
+    flowCtx2.drawImage(video, 0, 0, FW, FH);
+  }
+  flowCtx2.restore();
+
+  // Convert to grayscale
+  const imageData = flowCtx2.getImageData(0, 0, FW, FH);
+  const d = imageData.data;
+  for (let i = 0; i < FW * FH; i++) {
+    currGray[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+  }
+
+  flowFrameCount++;
+  if (flowFrameCount < 2) return; // Need two frames
+
+  // Track timing for velocity scaling
+  const now = performance.now();
+  if (lastFlowTime > 0) flowDt = Math.max(16, now - lastFlowTime);
+  lastFlowTime = now;
+
+  // Horn-Schunck optical flow
+  const alpha2 = 80; // smoothness weight — higher = smoother, less noisy
+  const iterations = 12;
+
+  // Compute image derivatives (averaged over 2x2 neighborhoods)
+  for (let y = 0; y < FH - 1; y++) {
+    for (let x = 0; x < FW - 1; x++) {
+      const i = y * FW + x;
+      _Ix[i] = ((currGray[i + 1] - currGray[i]) + (currGray[i + FW + 1] - currGray[i + FW]) +
+                (prevGray[i + 1] - prevGray[i]) + (prevGray[i + FW + 1] - prevGray[i + FW])) * 0.25;
+      _Iy[i] = ((currGray[i + FW] - currGray[i]) + (currGray[i + FW + 1] - currGray[i + 1]) +
+                (prevGray[i + FW] - prevGray[i]) + (prevGray[i + FW + 1] - prevGray[i + 1])) * 0.25;
+      _It[i] = ((currGray[i] - prevGray[i]) + (currGray[i + 1] - prevGray[i + 1]) +
+                (currGray[i + FW] - prevGray[i + FW]) + (currGray[i + FW + 1] - prevGray[i + FW + 1])) * 0.25;
+    }
+  }
+
+  // Iterative Gauss-Seidel solve
+  flowU.fill(0);
+  flowV.fill(0);
+
+  for (let iter = 0; iter < iterations; iter++) {
+    for (let y = 1; y < FH - 1; y++) {
+      for (let x = 1; x < FW - 1; x++) {
+        const i = y * FW + x;
+        const uAvg = (flowU[i - 1] + flowU[i + 1] + flowU[i - FW] + flowU[i + FW]) * 0.25;
+        const vAvg = (flowV[i - 1] + flowV[i + 1] + flowV[i - FW] + flowV[i + FW]) * 0.25;
+        const denom = alpha2 + _Ix[i] * _Ix[i] + _Iy[i] * _Iy[i];
+        const p = (_Ix[i] * uAvg + _Iy[i] * vAvg + _It[i]) / denom;
+        flowU[i] = uAvg - _Ix[i] * p;
+        flowV[i] = vAvg - _Iy[i] * p;
+      }
+    }
+  }
+
+  // Mask flow to body region — ignore background motion
+  for (let i = 0; i < FW * FH; i++) {
+    if (fieldMask[i] < VESSEL.BODY_THRESH) {
+      flowU[i] = 0;
+      flowV[i] = 0;
+    }
+  }
+
+  hasFlow = true;
+}
+
+// ====================== VESSEL: SPAWN ======================
+
+function spawnVessel() {
+  count = 0;
+  const FW = VESSEL.FIELD_W, FH = VESSEL.FIELD_H;
+  const cells = [];
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      if (fieldMask[y * FW + x] > VESSEL.BODY_THRESH) cells.push(y * FW + x);
+    }
+  }
+  if (cells.length === 0) return;
+
+  for (let i = 0; i < VESSEL.COUNT; i++) {
+    const idx = cells[Math.floor(Math.random() * cells.length)];
+    const cx = idx % FW, cy = (idx / FW) | 0;
+    spawn(
+      (cx + Math.random()) / FW * W,
+      (cy + Math.random()) / FH * H,
+      0, 0  // start at rest — gravity will settle them
+    );
+  }
+
+  ctx.fillStyle = BG + '1)';
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ====================== VESSEL: SIMULATE ======================
+// FRESH-HOME MODEL: Each frame, a particle's "home" is the nearest mask cell
+// to its current position — computed fresh, never accumulated, no drift.
+// Platform motion comes from body centroid delta (uniform, stable).
+// Spring pulls particles toward home. Gravity + spread provide interior physics.
+// Hard containment teleports escapees back inside.
+
+// Pre-allocate body cell list for home-finding
+const _bodyCells = new Int32Array(VESSEL.FIELD_W * VESSEL.FIELD_H);
+var _bodyCellCount = 0;
+
+function simVessel(dt) {
+  if (!hasMask || count === 0) return;
+
+  const FW = VESSEL.FIELD_W, FH = VESSEL.FIELD_H;
+  const spreadR2 = VESSEL.SPREAD_RADIUS * VESSEL.SPREAD_RADIUS;
+  const oR2 = VESSEL.OVERLAP_R * VESSEL.OVERLAP_R;
+
+  // === PHASE 1: Platform motion — move ALL particles with body centroid ===
+  // This is the "standing on a moving train" effect. Uniform, no per-particle drift.
+  const platDX = bodyVelX * VESSEL.PLATFORM;
+  const platDY = bodyVelY * VESSEL.PLATFORM;
+  for (let i = 0; i < count; i++) {
+    px[i] += platDX;
+    py[i] += platDY;
+  }
+
+  // === PHASE 2: Compute fresh homes (nearest mask cell to each particle) ===
+  // Build body cell list once
+  _bodyCellCount = 0;
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      if (fieldMask[y * FW + x] > VESSEL.BODY_THRESH) {
+        _bodyCells[_bodyCellCount++] = y * FW + x;
+      }
+    }
+  }
+
+  if (_bodyCellCount === 0) return; // no body visible
+
+  for (let i = 0; i < count; i++) {
+    // Particle position in field coordinates
+    const pfx = px[i] / W * FW;
+    const pfy = py[i] / H * FH;
+    const pix = Math.floor(pfx), piy = Math.floor(pfy);
+
+    // Check if particle is inside mask
+    const inside = pix >= 0 && pix < FW && piy >= 0 && piy < FH &&
+                   fieldMask[piy * FW + pix] > VESSEL.BODY_THRESH;
+
+    if (inside) {
+      // Inside body — home IS the particle position (zero spring force)
+      homeX[i] = px[i];
+      homeY[i] = py[i];
+    } else {
+      // Outside body — find nearest mask cell
+      let bestD2 = Infinity, bestIdx = 0;
+      // Spiral search from particle position (fast for nearby cells)
+      const maxR = Math.max(FW, FH);
+      let found = false;
+      for (let r = 1; r <= maxR && !found; r++) {
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+            const sx = pix + dx, sy = piy + dy;
+            if (sx < 0 || sx >= FW || sy < 0 || sy >= FH) continue;
+            if (fieldMask[sy * FW + sx] > VESSEL.BODY_THRESH) {
+              const dd = dx * dx + dy * dy;
+              if (dd < bestD2) { bestD2 = dd; bestIdx = sy * FW + sx; }
+              found = true; // found at this radius, finish this ring
+            }
+          }
+        }
+      }
+      homeX[i] = ((bestIdx % FW) + 0.5) / FW * W;
+      homeY[i] = (((bestIdx / FW) | 0) + 0.5) / FH * H;
+    }
+  }
+
+  // Build spatial hash for spread pressure
+  hashReset();
+  for (let i = 0; i < count; i++) hashInsert(i);
+
+  // === PHASE 3: Forces — spring + gravity + spread ===
+  for (let i = 0; i < count; i++) {
+    // Spring toward home (only active when outside mask)
+    const sdx = homeX[i] - px[i], sdy = homeY[i] - py[i];
+    pvx[i] += sdx * VESSEL.SPRING_K;
+    pvy[i] += sdy * VESSEL.SPRING_K;
+
+    // Gravity
+    pvy[i] += VESSEL.GRAVITY;
+
+    // Spread pressure — prevents clumping
+    const ci = (px[i] / cellSize) | 0;
+    const cj = (py[i] / cellSize) | 0;
+    for (let dy2 = -1; dy2 <= 1; dy2++) {
+      const gy2 = cj + dy2;
+      if (gy2 < 0 || gy2 >= gridH) continue;
+      for (let dx2 = -1; dx2 <= 1; dx2++) {
+        const gx2 = ci + dx2;
+        if (gx2 < 0 || gx2 >= gridW) continue;
+        let j = gridHead[gy2 * gridW + gx2];
+        while (j >= 0) {
+          if (j !== i) {
+            const ddx = px[j] - px[i], ddy = py[j] - py[i];
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < spreadR2 && d2 > 0.01) {
+              const d = Math.sqrt(d2);
+              const str = VESSEL.SPREAD_FORCE * (1 - d / VESSEL.SPREAD_RADIUS);
+              pvx[i] -= (ddx / d) * str;
+              pvy[i] -= (ddy / d) * str;
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+
+    // Damping
+    pvx[i] *= VESSEL.SPRING_DAMP;
+    pvy[i] *= VESSEL.SPRING_DAMP;
+
+    // Speed limit
+    const spd = Math.sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i]);
+    if (spd > VESSEL.MAX_SPEED) {
+      pvx[i] *= VESSEL.MAX_SPEED / spd;
+      pvy[i] *= VESSEL.MAX_SPEED / spd;
+    }
+
+    // Integrate
+    px[i] += pvx[i] * dt;
+    py[i] += pvy[i] * dt;
+  }
+
+  // === PHASE 4: Hard containment — teleport escapees inside ===
+  for (let i = 0; i < count; i++) {
+    const pfx = px[i] / W * FW, pfy = py[i] / H * FH;
+    const pix = Math.floor(pfx), piy = Math.floor(pfy);
+    if (pix < 0 || pix >= FW || piy < 0 || piy >= FH ||
+        fieldMask[piy * FW + pix] < VESSEL.BODY_THRESH) {
+      // Teleport to home (which is always on the mask)
+      px[i] = homeX[i]; py[i] = homeY[i];
+      pvx[i] *= 0.3; pvy[i] *= 0.3; // dampen but don't kill velocity
+    }
+  }
+
+  // === PHASE 5: Overlap resolution ===
+  hashReset();
+  for (let i = 0; i < count; i++) hashInsert(i);
+
+  for (let i = 0; i < count; i++) {
+    const ci = (px[i] / cellSize) | 0;
+    const cj = (py[i] / cellSize) | 0;
+    for (let dy2 = -1; dy2 <= 1; dy2++) {
+      const gy2 = cj + dy2;
+      if (gy2 < 0 || gy2 >= gridH) continue;
+      for (let dx2 = -1; dx2 <= 1; dx2++) {
+        const gx2 = ci + dx2;
+        if (gx2 < 0 || gx2 >= gridW) continue;
+        let j = gridHead[gy2 * gridW + gx2];
+        while (j >= 0) {
+          if (j > i) {
+            const ddx = px[j] - px[i], ddy = py[j] - py[i];
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < oR2 && d2 > 0.01) {
+              const d = Math.sqrt(d2);
+              const nx = ddx / d, ny = ddy / d;
+              const push = (VESSEL.OVERLAP_R - d) * VESSEL.OVERLAP_PUSH * 0.5;
+              px[i] -= nx * push; py[i] -= ny * push;
+              px[j] += nx * push; py[j] += ny * push;
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+  }
+}
+
+// ====================== MODE TRANSITION ======================
+
+function transitionToVessel() {
+  mode = 'vessel';
+  cellSize = VESSEL.CELL;
+  rebuildGrid();
+  spawnVessel();
+  document.getElementById('overlay').style.display = 'none';
+}
+
+// ====================== RENDERING ======================
+
+function render() {
+  // Trail fade — slower for flock (dreamy), faster for vessel (clean)
+  const trailAlpha = mode === 'flock' ? FLOCK.TRAIL_ALPHA : VESSEL.TRAIL_ALPHA;
+  ctx.fillStyle = BG + trailAlpha + ')';
+  ctx.fillRect(0, 0, W, H);
+
+  // Video overlay (vessel mode, toggleable with 'v')
+  if (showVideo && cameraActive) {
+    ctx.save();
+    if (videoFileMode) {
+      ctx.globalAlpha = 0.3;
+      ctx.drawImage(video, 0, 0, W, H);
+    } else {
+      ctx.globalAlpha = 0.1;
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, -W, 0, W, H);
+    }
+    ctx.restore();
+  }
+
+  if (count === 0) return;
+
+  // Compute speeds for rendering
+  for (let i = 0; i < count; i++) {
+    pspeed[i] = Math.sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i]);
+  }
+
+  const [ir, ig, ib] = INK;
+
+  // Slow/settled particles → dots
+  ctx.fillStyle = `rgba(${ir},${ig},${ib},0.4)`;
+  ctx.beginPath();
+  for (let i = 0; i < count; i++) {
+    if (pspeed[i] < DOT_THRESH) {
+      ctx.moveTo(px[i] + DOT_R, py[i]);
+      ctx.arc(px[i], py[i], DOT_R, 0, Math.PI * 2);
+    }
+  }
+  ctx.fill();
+
+  // Moving particles → directional marks, binned by speed
+  ctx.lineCap = 'round';
+  const maxSpd = mode === 'flock' ? FLOCK.MAX_SPEED : VESSEL.MAX_SPEED;
+  const BINS = 6;
+  const binSize = (maxSpd - DOT_THRESH) / BINS;
+
+  for (let b = 0; b < BINS; b++) {
+    const t = (b + 1) / BINS;
+    const alpha = 0.25 + t * 0.5;
+    const width = MARK_W * (1 - t * 0.4);
+
+    ctx.strokeStyle = `rgba(${ir},${ig},${ib},${alpha.toFixed(2)})`;
+    ctx.lineWidth = Math.max(width, 0.5);
+    ctx.beginPath();
+    let any = false;
+
+    for (let i = 0; i < count; i++) {
+      if (pspeed[i] < DOT_THRESH) continue;
+      const bin = Math.min(Math.floor((pspeed[i] - DOT_THRESH) / binSize), BINS - 1);
+      if (bin !== b) continue;
+
+      const len = MARK_MIN + pspeed[i] * MARK_SCALE;
+      const nx = pvx[i] / pspeed[i], ny = pvy[i] / pspeed[i];
+      ctx.moveTo(px[i] - nx * len * 0.5, py[i] - ny * len * 0.5);
+      ctx.lineTo(px[i] + nx * len * 0.5, py[i] + ny * len * 0.5);
+      any = true;
+    }
+
+    if (any) ctx.stroke();
+  }
+
+  // Silhouette overlay — shows the actual segmentation mask the physics uses
+  // Drawn to offscreen canvas and composited in one shot to prevent trail smearing
+  if (showSkeleton && hasMask) {
+    const FW = VESSEL.FIELD_W, FH = VESSEL.FIELD_H;
+    if (!render._silCanvas) {
+      render._silCanvas = document.createElement('canvas');
+      render._silCanvas.width = FW;
+      render._silCanvas.height = FH;
+      render._silCtx = render._silCanvas.getContext('2d');
+    }
+    const sctx = render._silCtx;
+    const sid = sctx.createImageData(FW, FH);
+    const sd = sid.data;
+    for (let fy = 0; fy < FH; fy++) {
+      for (let fx = 0; fx < FW; fx++) {
+        const v = fieldMask[fy * FW + fx];
+        const idx = (fy * FW + fx) * 4;
+        if (v > 0.1) {
+          sd[idx] = 0;
+          sd[idx + 1] = 200;
+          sd[idx + 2] = 255;
+          sd[idx + 3] = (v > VESSEL.BODY_THRESH ? 0.35 : v * 0.35) * 255;
+        }
+      }
+    }
+    sctx.putImageData(sid, 0, 0);
+    ctx.drawImage(render._silCanvas, 0, 0, W, H);
+  }
+}
+
+// ====================== MEDIAPIPE ======================
+var poseLandmarker = null;
+var cameraActive = false;
+var mediaPipeReady = false;
+var lastDetectTime = 0;
+const DETECT_INTERVAL = 50;
+
+async function initMediaPipe() {
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = 'loading mediapipe...';
+
+  try {
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm');
+    const { PoseLandmarker, FilesetResolver } = vision;
+
+    statusEl.textContent = 'loading wasm runtime...';
+    const fr = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+
+    statusEl.textContent = 'loading pose model...';
+    poseLandmarker = await PoseLandmarker.createFromOptions(fr, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+      },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      outputSegmentationMasks: true,
+    });
+
+    mediaPipeReady = true;
+    statusEl.textContent = 'detecting body...';
+    return true;
+  } catch (e) {
+    console.error('MediaPipe init failed:', e);
+    document.getElementById('status').textContent = 'mediapipe failed';
+    setTimeout(() => { document.getElementById('overlay').style.display = 'none'; }, 3000);
+    return false;
+  }
+}
+
+var detectCount = 0, detectErrors = 0, maskCount = 0;
+var currentLandmarks = null;
+
+// MediaPipe pose skeleton connections (pairs of landmark indices)
+const POSE_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],  // face
+  [9,10],                                             // mouth
+  [11,12],                                            // shoulders
+  [11,13],[13,15],[15,17],[15,19],[15,21],             // left arm
+  [12,14],[14,16],[16,18],[16,20],[16,22],             // right arm
+  [11,23],[12,24],[23,24],                             // torso
+  [23,25],[25,27],[27,29],[27,31],                     // left leg
+  [24,26],[26,28],[28,30],[28,32],                     // right leg
+];
+
+function detectPose(timestamp) {
+  if (!poseLandmarker || !cameraActive) return;
+  if (timestamp - lastDetectTime < DETECT_INTERVAL) return;
+  if (video.readyState < 2) return;
+
+  lastDetectTime = timestamp;
+  detectCount++;
+
+  try {
+    const result = poseLandmarker.detectForVideo(video, performance.now());
+
+    // Store landmarks for skeleton overlay only
+    if (result.landmarks && result.landmarks.length > 0) {
+      currentLandmarks = result.landmarks[0];
+    }
+
+    if (result.segmentationMasks && result.segmentationMasks.length > 0) {
+      try {
+        const mask = result.segmentationMasks[0];
+        const data = mask.getAsFloat32Array();
+        updateMask(data, mask.width, mask.height);
+        maskCount++;
+      } catch (e) {
+        if (detectErrors <= 3) console.warn('[bodypipe] mask error:', e);
+      }
+    }
+
+    // Compute optical flow from video frames
+    captureAndComputeFlow();
+  } catch (e) {
+    detectErrors++;
+    if (detectErrors <= 5) console.error('[bodypipe] detect error:', e);
+  }
+}
+
+// ====================== CAMERA ======================
+async function startCamera() {
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('fileLabel').style.display = 'none';
+
+  const mpPromise = initMediaPipe();
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    video.muted = true;
+    await video.play();
+    cameraActive = true;
+  } catch (e) {
+    console.error('Camera failed:', e);
+    document.getElementById('status').textContent = 'camera unavailable';
+    setTimeout(() => { document.getElementById('overlay').style.display = 'none'; }, 2000);
+    return;
+  }
+
+  await mpPromise;
+}
+
+// ====================== VIDEO FILE ======================
+async function startVideoFile(file) {
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('fileLabel').style.display = 'none';
+
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = 'loading video: ' + file.name;
+  console.log('[bodypipe] startVideoFile:', file.name, file.type, file.size);
+
+  const mpPromise = initMediaPipe();
+
+  const url = URL.createObjectURL(file);
+  video.srcObject = null;
+  video.src = url;
+  video.loop = true;
+  video.muted = true;
+  video.playsInline = true;
+
+  const loaded = await new Promise(resolve => {
+    let done = false;
+    const ok = evt => { if (!done) { done = true; console.log('[bodypipe] video ready:', evt); resolve(true); } };
+    const fail = () => { if (!done) { done = true; console.error('[bodypipe] video error:', video.error); resolve(false); } };
+    video.addEventListener('canplay', () => ok('canplay'), { once: true });
+    video.addEventListener('loadeddata', () => ok('loadeddata'), { once: true });
+    video.addEventListener('loadedmetadata', () => ok('loadedmetadata'), { once: true });
+    video.addEventListener('error', fail, { once: true });
+    setTimeout(() => { if (!done) { done = true; resolve(false); } }, 8000);
+    video.load();
+  });
+
+  if (!loaded) {
+    statusEl.textContent = 'video failed — try MP4/H.264';
+    document.getElementById('startBtn').style.display = '';
+    document.getElementById('fileLabel').style.display = '';
+    return;
+  }
+
+  statusEl.textContent = 'starting playback...';
+  try {
+    await video.play();
+    cameraActive = true;
+    videoFileMode = true;
+    showVideo = true;
+    console.log('[bodypipe] video playing:', video.videoWidth, 'x', video.videoHeight);
+  } catch (e) {
+    console.error('[bodypipe] playback failed:', e);
+    statusEl.textContent = 'playback failed: ' + e.message;
+    document.getElementById('startBtn').style.display = '';
+    document.getElementById('fileLabel').style.display = '';
+    return;
+  }
+
+  await mpPromise;
+}
+
+// ====================== EVENT LISTENERS ======================
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  if (!cameraActive) startCamera();
+});
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) startVideoFile(e.target.files[0]);
+});
+
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('video/')) startVideoFile(f);
+});
+
+canvas.addEventListener('click', () => {
+  if (!cameraActive) startCamera();
+});
+
+var showDebug = false;
+var showVideo = false;
+var showSkeleton = false;
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'd') {
+    showDebug = !showDebug;
+    document.getElementById('debug').style.display = showDebug ? 'block' : 'none';
+  }
+  if (e.key === 'v') showVideo = !showVideo;
+  if (e.key === 'b') showSkeleton = !showSkeleton;
+  if (e.key === 'r') {
+    if (mode === 'vessel' && hasMask && bodyDetected) spawnVessel();
+    if (mode === 'flock') spawnFlock();
+  }
+  if (e.key === 't') {
+    const panel = document.getElementById('tuner');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  }
+});
+
+// ====================== TUNER PANEL ======================
+const TUNER_DEFS = [
+  { key: 'SPRING_K',        label: 'spring stiffness',  min: 0.01, max: 0.5,  step: 0.01 },
+  { key: 'SPRING_DAMP',     label: 'spring damping',    min: 0.5,  max: 0.99, step: 0.01 },
+  { key: 'PLATFORM',        label: 'body tracking',     min: 0,    max: 1.0,  step: 0.01 },
+  { key: 'GRAVITY',         label: 'gravity',           min: 0,    max: 0.5,  step: 0.01 },
+  { key: 'SPREAD_RADIUS',   label: 'spread radius',     min: 4,    max: 80,   step: 1 },
+  { key: 'SPREAD_FORCE',    label: 'spread force',      min: 0,    max: 0.5,  step: 0.005 },
+  { key: 'OVERLAP_R',       label: 'overlap radius',    min: 1,    max: 20,   step: 0.5 },
+  { key: 'OVERLAP_PUSH',    label: 'overlap push',      min: 0.05, max: 1.0,  step: 0.05 },
+  { key: 'MAX_SPEED',       label: 'max speed',         min: 2,    max: 60,   step: 1 },
+  { key: 'BODY_THRESH',     label: 'body threshold',    min: 0.1,  max: 0.9,  step: 0.05 },
+  { key: 'TRAIL_ALPHA',     label: 'trail fade',        min: 0.01, max: 0.3,  step: 0.01 },
+];
+
+// Virtual params (not in VESSEL directly) — currently unused
+const virtualParams = {};
+
+// ====================== VISUAL TUNER DEFS ======================
+const VIS_DEFS = [
+  { key: 'COUNT',       label: 'particles',       min: 100,  max: 5000, step: 100, respawn: true },
+  { key: 'DOT_R',       label: 'dot size',         min: 0.5,  max: 6,    step: 0.1 },
+  { key: 'MARK_MIN',    label: 'mark min length',  min: 0,    max: 8,    step: 0.5 },
+  { key: 'MARK_SCALE',  label: 'mark speed scale', min: 0,    max: 10,   step: 0.5 },
+  { key: 'MARK_W',      label: 'mark width',       min: 0.5,  max: 6,    step: 0.1 },
+  { key: 'DOT_THRESH',  label: 'dot/mark threshold', min: 0.1, max: 5,   step: 0.1 },
+];
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join('');
+}
+function hexToRgb(hex) {
+  const m = hex.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [0, 0, 0];
+}
+
+{
+  const panel = document.getElementById('tuner');
+  let html = '<h3>physics tuner</h3>';
+  for (const d of TUNER_DEFS) {
+    const cur = d.virtual ? d.init : VESSEL[d.key];
+    html += `<label>${d.label}<input type="range" id="tune_${d.key}" min="${d.min}" max="${d.max}" step="${d.step}" value="${cur}"><span class="val" id="tunev_${d.key}">${cur}</span></label>`;
+  }
+
+  html += '<div class="section"><h3>visuals</h3>';
+
+  // Color pickers
+  html += `<label>particle color <input type="color" id="tune_INK" value="${rgbToHex(...INK)}"><span class="val" id="tunev_INK">${rgbToHex(...INK)}</span></label>`;
+  html += `<label>background <input type="color" id="tune_BG" value="${rgbToHex(...BG_RGB)}"><span class="val" id="tunev_BG">${rgbToHex(...BG_RGB)}</span></label>`;
+
+  // Numeric sliders
+  for (const d of VIS_DEFS) {
+    const visVals = { DOT_R, MARK_MIN, MARK_SCALE, MARK_W, DOT_THRESH };
+    const cur = d.key === 'COUNT' ? VESSEL.COUNT : visVals[d.key];
+    html += `<label>${d.label}<input type="range" id="tune_V_${d.key}" min="${d.min}" max="${d.max}" step="${d.step}" value="${cur}"><span class="val" id="tunev_V_${d.key}">${cur}</span></label>`;
+  }
+  html += '</div>';
+
+  panel.innerHTML = html;
+
+  // Physics slider handlers
+  for (const d of TUNER_DEFS) {
+    const slider = document.getElementById('tune_' + d.key);
+    const valSpan = document.getElementById('tunev_' + d.key);
+    slider.addEventListener('input', () => {
+      const v = parseFloat(slider.value);
+      valSpan.textContent = v % 1 === 0 ? v : v.toFixed(d.step < 0.01 ? 3 : 2);
+      if (d.virtual) { virtualParams[d.key] = v; }
+      else { VESSEL[d.key] = v; }
+    });
+  }
+
+  // Color handlers
+  document.getElementById('tune_INK').addEventListener('input', (e) => {
+    INK = hexToRgb(e.target.value);
+    document.getElementById('tunev_INK').textContent = e.target.value;
+  });
+  document.getElementById('tune_BG').addEventListener('input', (e) => {
+    BG_RGB = hexToRgb(e.target.value);
+    BG = `rgba(${BG_RGB[0]}, ${BG_RGB[1]}, ${BG_RGB[2]},`;
+    document.getElementById('tunev_BG').textContent = e.target.value;
+  });
+
+  // Visual slider handlers
+  for (const d of VIS_DEFS) {
+    const slider = document.getElementById('tune_V_' + d.key);
+    const valSpan = document.getElementById('tunev_V_' + d.key);
+    slider.addEventListener('input', () => {
+      const v = parseFloat(slider.value);
+      valSpan.textContent = v % 1 === 0 ? v : v.toFixed(d.step < 0.1 ? 2 : 1);
+      if (d.key === 'COUNT') {
+        VESSEL.COUNT = v;
+        FLOCK.COUNT = v;
+      } else if (d.key === 'DOT_R') DOT_R = v;
+      else if (d.key === 'MARK_MIN') MARK_MIN = v;
+      else if (d.key === 'MARK_SCALE') MARK_SCALE = v;
+      else if (d.key === 'MARK_W') MARK_W = v;
+      else if (d.key === 'DOT_THRESH') DOT_THRESH = v;
+    });
+    // For particle count, respawn on change end
+    if (d.respawn) {
+      slider.addEventListener('change', () => {
+        if (mode === 'vessel' && hasMask && bodyDetected) spawnVessel();
+        else if (mode === 'flock') spawnFlock();
+      });
+    }
+  }
+}
+
+// ====================== MAIN LOOP ======================
+var lastFrameTime = 0;
+var fpsStart = 0, fpsFrames = 0, fps = 60;
+
+function frame(t) {
+  const dt = lastFrameTime ? Math.min((t - lastFrameTime) / 16.67, 2.5) : 1;
+  lastFrameTime = t;
+
+  fpsFrames++;
+  if (fpsFrames >= 30) {
+    if (fpsStart > 0) fps = Math.round(30000 / (t - fpsStart));
+    fpsStart = t; fpsFrames = 0;
+  }
+
+  detectPose(t);
+
+  if (mode === 'flock') simFlock(dt);
+  else simVessel(dt);
+
+  render();
+
+  if (showDebug) {
+    const dbg = document.getElementById('debug');
+    dbg.style.display = 'block';
+    let txt = `${fps} fps | ${count} particles | mode: ${mode}`;
+    if (mode === 'vessel') {
+      txt += ` | vel: ${bodyVelX.toFixed(1)},${bodyVelY.toFixed(1)}`;
+      txt += ` | acc: ${bodyAccX.toFixed(2)},${bodyAccY.toFixed(2)}`;
+      txt += ` | masks: ${maskCount}`;
+    }
+    dbg.textContent = txt;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ====================== INIT ======================
+cellSize = FLOCK.CELL;
+rebuildGrid();
+spawnFlock();
+
+ctx.fillStyle = BG + '1)';
+ctx.fillRect(0, 0, W, H);
+
+setTimeout(() => {
+  const hint = document.getElementById('hint');
+  hint.style.transition = 'opacity 2s';
+  hint.style.opacity = '0';
+}, 5000);
+
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>

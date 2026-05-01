@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head><title>probing</title></head>
+<body>
+<pre id="out">probing...</pre>
+<script>
+(async () => {
+  const el = document.getElementById('out');
+  const log = (m) => { console.log('PROBE ' + m); el.textContent += '\n' + m; document.title = m; };
+
+  try {
+    if (!navigator.gpu) { log('NO_WEBGPU — navigator.gpu is undefined'); return; }
+    log('navigator.gpu exists');
+
+    // requestAdapter() can hang on some GPU/driver combos — race with timeout
+    const TIMEOUT = 5000;
+    const tryAdapter = async (opts, label) => {
+      log(`trying requestAdapter(${label})...`);
+      const result = await Promise.race([
+        navigator.gpu.requestAdapter(opts),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT after ' + TIMEOUT + 'ms')), TIMEOUT)),
+      ]);
+      return result;
+    };
+
+    let adapter = null;
+    // Try high-performance first (forces discrete GPU selection)
+    try {
+      adapter = await tryAdapter({ powerPreference: 'high-performance' }, 'high-performance');
+    } catch (e) {
+      log('high-performance failed: ' + e.message);
+    }
+
+    // Fallback: default
+    if (!adapter) {
+      try {
+        adapter = await tryAdapter({}, 'default');
+      } catch (e) {
+        log('default failed: ' + e.message);
+      }
+    }
+
+    // Fallback: low-power
+    if (!adapter) {
+      try {
+        adapter = await tryAdapter({ powerPreference: 'low-power' }, 'low-power');
+      } catch (e) {
+        log('low-power failed: ' + e.message);
+      }
+    }
+
+    if (!adapter) {
+      log('ALL ADAPTERS FAILED — requestAdapter() hangs or returns null');
+      log('Workaround: try chrome://flags/#enable-unsafe-webgpu or update GPU driver');
+      return;
+    }
+
+    const info = adapter.info || {};
+    log('ADAPTER vendor=' + info.vendor + ' arch=' + info.architecture + ' device=' + info.device + ' desc=' + info.description + ' fallback=' + !!adapter.isFallbackAdapter);
+
+    log('requesting device...');
+    const dev = await Promise.race([
+      adapter.requestDevice(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), TIMEOUT)),
+    ]);
+    log('DEVICE ok=' + !!dev);
+
+    // Quick compute test
+    const module = dev.createShaderModule({ code: `@compute @workgroup_size(1) fn main() {}` });
+    const pipeline = dev.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    dev.queue.submit([enc.finish()]);
+    await dev.queue.onSubmittedWorkDone();
+    log('COMPUTE TEST PASSED');
+    log('DONE — WebGPU is fully working');
+  } catch (e) {
+    log('ERROR: ' + e.message);
+  }
+})();
+</script>
+</body>
+</html>

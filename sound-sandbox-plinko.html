@@ -1,0 +1,1530 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Sound Sandbox — Plinko Edition</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; user-select: none; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; transition: border-color 0.08s; }
+canvas.beat-flash { border-color: rgba(100,180,120,0.6); }
+.toolbar { display: flex; gap: 4px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 920px; justify-content: center; }
+.btn { padding: 4px 8px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; transition: all 0.15s; display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.btn.active { border-color: #fff; background: #3a3a5e; box-shadow: 0 0 6px rgba(255,255,255,0.15); }
+.btn.ball-active { border-color: #fa4; background: #3e3a2a; box-shadow: 0 0 8px rgba(255,170,60,0.2); }
+.btn.emitter-active { border-color: #f66; background: #3e1a1a; box-shadow: 0 0 8px rgba(255,100,100,0.25); }
+.btn:hover { background: #3a3a5e; }
+.btn .swatch { width: 14px; height: 8px; border-radius: 2px; margin-bottom: 1px; }
+.btn .ball-swatch { width: 12px; height: 12px; border-radius: 50%; margin-bottom: 1px; border: 1px solid rgba(255,255,255,0.2); }
+.btn .key { font-size: 9px; color: #888; }
+.sep { width: 1px; height: 32px; background: #444; margin: 0 4px; }
+.preset-btn { padding: 6px 12px; border: 1px solid #665; background: #2a2e2a; color: #8a8; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; transition: all 0.15s; }
+.preset-btn:hover { background: #3a4e3a; color: #afa; }
+h1 { font-size: 14px; margin-bottom: 2px; color: #888; }
+.subtitle { font-size: 10px; color: #555; margin-bottom: 8px; font-style: italic; }
+.status { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #666; align-items: center; flex-wrap: wrap; justify-content: center; }
+.info { margin-top: 6px; font-size: 10px; color: #555; max-width: 920px; text-align: center; line-height: 1.5; }
+.vol { display: flex; align-items: center; gap: 4px; }
+.vol input[type=range] { width: 60px; accent-color: #6a8; }
+#audio-badge { padding: 3px 8px; border-radius: 3px; font-size: 10px; cursor: pointer; transition: all 0.2s; }
+#audio-badge.off { background: #442; color: #a86; }
+#audio-badge.on { background: #243; color: #6a8; }
+/* BPM bar */
+.bpm-bar { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; justify-content: center; flex-wrap: wrap; }
+.bpm-bar button { padding: 4px 10px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 12px; transition: all 0.15s; min-width: 28px; }
+.bpm-bar button:hover { background: #3a3a5e; }
+.bpm-bar button.playing { border-color: #6a8; color: #6a8; background: #1a2e1a; box-shadow: 0 0 8px rgba(100,180,120,0.2); }
+.bpm-bar input[type=number] { width: 52px; padding: 3px 4px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; border-radius: 3px; font-family: monospace; font-size: 12px; text-align: center; -moz-appearance: textfield; }
+.bpm-bar input[type=number]::-webkit-inner-spin-button,
+.bpm-bar input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.bpm-bar label { font-size: 11px; color: #888; }
+.bpm-bar .sep { height: 24px; }
+.beat-dots { display: flex; gap: 3px; align-items: center; }
+.beat-dot { width: 8px; height: 8px; border-radius: 50%; background: #2a2a3e; border: 1px solid #444; transition: background 0.06s, border-color 0.06s, box-shadow 0.06s; }
+.beat-dot.active { background: #6a8; border-color: #6a8; box-shadow: 0 0 5px rgba(100,180,120,0.5); }
+.beat-dot.downbeat { background: #8cf; border-color: #8cf; box-shadow: 0 0 6px rgba(130,200,255,0.6); }
+</style>
+</head>
+<body>
+<h1>sound sandbox — plinko edition</h1>
+<div class="subtitle">drop steel, glass, rubber, and water through a world of sound</div>
+<div class="toolbar" id="toolbar"></div>
+<div class="bpm-bar" id="bpm-bar">
+  <button id="bpm-play" title="Start/stop emitter clock (Enter)">&#9654; Play</button>
+  <label>BPM</label>
+  <button id="bpm-down" title="BPM -5 ([)">&#8722;</button>
+  <input type="number" id="bpm-input" value="120" min="40" max="300" step="1">
+  <button id="bpm-up" title="BPM +5 (])">+</button>
+  <div class="sep"></div>
+  <div class="beat-dots">
+    <span class="beat-dot" id="bd0"></span>
+    <span class="beat-dot" id="bd1"></span>
+    <span class="beat-dot" id="bd2"></span>
+    <span class="beat-dot" id="bd3"></span>
+  </div>
+  <div class="sep"></div>
+  <span id="emitter-count" style="font-size:11px;color:#666">0 emitters</span>
+</div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span>
+  <span id="particles">0 particles</span>
+  <span id="ball-count">0 balls</span>
+  <span id="collisions-display">0 sounds</span>
+  <span id="audio-badge" class="off">click to enable audio</span>
+  <div class="vol"><label>vol</label><input type="range" id="vol" min="0" max="100" value="60"></div>
+</div>
+<div class="info">
+  Draw: click+drag &middot; Erase: right-click &middot; Brush: scroll &middot; 0-6: materials<br>
+  <b>Z</b>=Steel <b>X</b>=Glass <b>V</b>=Rubber <b>B</b>=Water ball &middot; <b>E</b>=Emitter mode &middot; <b>P</b>=plinko preset<br>
+  <b>Enter</b>=play/stop BPM &middot; <b>[</b>/<b>]</b>=BPM -/+5 &middot; Space: pause &middot; C: clear &middot; M: mute<br>
+  <b>Emitter mode:</b> click to place, right-click to remove, scroll to change division (1 &frac12; &frac14; &#8539; 1/16)
+</div>
+
+<script>
+// ==================== MATERIAL CONSTANTS ====================
+const W = 300, H = 200, SCALE = 3;
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, METAL = 4, GLASS = 5, WOOD = 6;
+const DENSITY = [0, 4, 3, 8, 9, 8, 5];
+
+const MAT_INFO = [
+  { name: 'Erase',  key: '0', rgb: [40, 40, 60] },
+  { name: 'Sand',   key: '1', rgb: [210, 180, 100] },
+  { name: 'Water',  key: '2', rgb: [40, 80, 200] },
+  { name: 'Stone',  key: '3', rgb: [120, 120, 130] },
+  { name: 'Metal',  key: '4', rgb: [170, 175, 182] },
+  { name: 'Glass',  key: '5', rgb: [180, 215, 250] },
+  { name: 'Wood',   key: '6', rgb: [100, 65, 30] },
+];
+
+// Pentatonic scale — C major pentatonic across 4 octaves
+const PENTA_FREQS = [
+  130.81, 146.83, 164.81, 196.00, 220.00,
+  261.63, 293.66, 329.63, 392.00, 440.00,
+  523.25, 587.33, 659.25, 783.99, 880.00,
+  1046.50, 1174.66, 1318.51, 1567.98, 1760.00,
+];
+
+const GLASS_FREQS = [
+  523.25, 587.33, 659.25, 783.99, 880.00,
+  1046.50, 1174.66, 1318.51, 1567.98, 1760.00,
+  2093.00, 2349.32, 2637.02, 3135.96, 3520.00,
+];
+
+// ==================== BALL TYPE DEFINITIONS ====================
+const BALL_TYPES = {
+  steel:  { name: 'Steel',  key: 'Z', radius: 2.5, mass: 8, restitution: 0.55, friction: 0.15, gravity: 0.15, color: [160, 172, 195], highlight: 'rgba(220,230,255,0.35)' },
+  glass:  { name: 'Glass',  key: 'X', radius: 2.0, mass: 5, restitution: 0.30, friction: 0.10, gravity: 0.13, color: [190, 220, 255], highlight: 'rgba(255,255,255,0.50)' },
+  rubber: { name: 'Rubber', key: 'V', radius: 3.0, mass: 3, restitution: 0.85, friction: 0.30, gravity: 0.10, color: [200, 55, 60],  highlight: 'rgba(255,180,180,0.25)' },
+  water:  { name: 'Water',  key: 'B', radius: 3.5, mass: 4, restitution: 0.05, friction: 0.05, gravity: 0.13, color: [50, 110, 220], highlight: 'rgba(150,200,255,0.40)' },
+};
+const BALL_ORDER = ['steel', 'glass', 'rubber', 'water'];
+const MAX_BALLS = 60;
+
+// ==================== EMITTER & BPM CONSTANTS ====================
+const DIVISIONS = [1, 2, 4, 8, 16];
+const DIV_LABELS = { 1: '1', 2: '\u00BD', 4: '\u00BC', 8: '\u215B', 16: '1/16' };
+const MAX_EMITTERS = 20;
+
+// ==================== GRID STATE ====================
+const grid = new Uint8Array(W * H);
+const movedPrev = new Uint8Array(W * H);
+const movedCur = new Uint8Array(W * H);
+
+// ==================== BALL STATE ====================
+const balls = [];
+
+// ==================== EMITTER STATE ====================
+const emitters = [];
+let bpm = 120;
+let bpmPlaying = false;
+let beatAccumulator = 0;
+let lastTickTime = 0;
+let currentBeat = -1;
+
+// ==================== CANVAS ====================
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const imgData = new ImageData(W, H);
+const pixels = new Uint32Array(imgData.data.buffer);
+const offscreen = new OffscreenCanvas(W, H);
+const octx = offscreen.getContext('2d');
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ==================== UI STATE ====================
+let material = SAND;
+let selectedBall = null; // null = draw mode, 'steel'|'glass'|'rubber'|'water' = ball mode
+let emitterMode = false;
+let brushSize = 3;
+let mouseDown = false;
+let rightDown = false;
+let mouseX = 0, mouseY = 0;
+let paused = false;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let currentFps = 60;
+let soundsThisFrame = 0;
+
+// ==================== HELPERS ====================
+function idx(x, y) { return y * W + x; }
+function inBounds(x, y) { return x >= 0 && x < W && y >= 0 && y < H; }
+function get(x, y) { return inBounds(x, y) ? grid[idx(x, y)] : STONE; }
+function isPowder(m) { return m === SAND; }
+function isLiquid(m) { return m === WATER; }
+function isSolid(m) { return m === STONE || m === METAL || m === GLASS || m === WOOD; }
+function isMobile(m) { return isPowder(m) || isLiquid(m); }
+
+function swap(x1, y1, x2, y2) {
+  const i1 = idx(x1, y1), i2 = idx(x2, y2);
+  const t = grid[i1]; grid[i1] = grid[i2]; grid[i2] = t;
+  movedCur[i1] = 1; movedCur[i2] = 1;
+}
+
+// ==================== COLLISION TRACKING (grid particles) ====================
+const collisions = [];
+let sandFlowCount = 0, waterFlowCount = 0;
+
+function recordLanding(x, y) {
+  const i = idx(x, y);
+  const mat = grid[i];
+  if (mat === EMPTY) return;
+  let surface = STONE;
+  if (y + 1 < H) {
+    const below = grid[idx(x, y + 1)];
+    if (below !== EMPTY) surface = below;
+    else return;
+  }
+  collisions.push({ x, y, impactor: mat, surface });
+}
+
+// ==================== GRID PHYSICS ====================
+function simulate() {
+  movedCur.fill(0);
+  collisions.length = 0;
+  sandFlowCount = 0;
+  waterFlowCount = 0;
+  const dir = frameCount & 1 ? 1 : -1;
+
+  for (let y = H - 1; y >= 0; y--) {
+    const x0 = dir > 0 ? 0 : W - 1;
+    for (let n = 0; n < W; n++) {
+      const x = x0 + n * dir;
+      const ci = idx(x, y);
+      const mat = grid[ci];
+      if (mat === EMPTY || isSolid(mat) || movedCur[ci]) continue;
+
+      if (isPowder(mat)) {
+        if (simulatePowder(x, y, mat)) continue;
+        if (movedPrev[ci]) recordLanding(x, y);
+      } else if (isLiquid(mat)) {
+        if (simulateLiquid(x, y, mat)) continue;
+        if (movedPrev[ci]) recordLanding(x, y);
+      }
+    }
+  }
+  movedPrev.set(movedCur);
+}
+
+function canFallInto(x, y, moverMat) {
+  if (!inBounds(x, y)) return false;
+  const target = get(x, y);
+  if (target === EMPTY) return true;
+  if (isPowder(moverMat) && isLiquid(target) && DENSITY[moverMat] > DENSITY[target]) return true;
+  return false;
+}
+
+function simulatePowder(x, y, mat) {
+  if (canFallInto(x, y + 1, mat)) { swap(x, y, x, y + 1); sandFlowCount++; return true; }
+  const d = Math.random() < 0.5 ? -1 : 1;
+  if (canFallInto(x + d, y + 1, mat)) { swap(x, y, x + d, y + 1); sandFlowCount++; return true; }
+  if (canFallInto(x - d, y + 1, mat)) { swap(x, y, x - d, y + 1); sandFlowCount++; return true; }
+  return false;
+}
+
+function simulateLiquid(x, y, mat) {
+  if (y + 1 < H && get(x, y + 1) === EMPTY) { swap(x, y, x, y + 1); waterFlowCount++; return true; }
+  const d = Math.random() < 0.5 ? -1 : 1;
+  if (y + 1 < H && inBounds(x + d, y + 1) && get(x + d, y + 1) === EMPTY) { swap(x, y, x + d, y + 1); waterFlowCount++; return true; }
+  if (y + 1 < H && inBounds(x - d, y + 1) && get(x - d, y + 1) === EMPTY) { swap(x, y, x - d, y + 1); waterFlowCount++; return true; }
+  const spread = 4;
+  const sd = Math.random() < 0.5 ? -1 : 1;
+  for (let pass = 0; pass < 2; pass++) {
+    const sdir = pass === 0 ? sd : -sd;
+    for (let s = 1; s <= spread; s++) {
+      const nx = x + sdir * s;
+      if (!inBounds(nx, y)) break;
+      if (get(nx, y) === EMPTY) { swap(x, y, nx, y); waterFlowCount++; return true; }
+      if (get(nx, y) !== WATER) break;
+    }
+  }
+  return false;
+}
+
+// ==================== BALL PHYSICS ====================
+function ballGridCollide(bx, by, r) {
+  const scan = Math.ceil(r) + 1;
+  const basex = Math.floor(bx), basey = Math.floor(by);
+  let hitMat = EMPTY, bestDensity = 0;
+  let nx = 0, ny = 0, contacts = 0;
+
+  for (let dy = -scan; dy <= scan; dy++) {
+    for (let dx = -scan; dx <= scan; dx++) {
+      const gx = basex + dx, gy = basey + dy;
+      if (!inBounds(gx, gy)) continue;
+      const mat = grid[idx(gx, gy)];
+      if (mat === EMPTY) continue;
+
+      const cx = gx + 0.5, cy = gy + 0.5;
+      const ddx = bx - cx, ddy = by - cy;
+      const distSq = ddx * ddx + ddy * ddy;
+      const threshold = r + 0.5;
+
+      if (distSq < threshold * threshold) {
+        const dist = Math.sqrt(distSq);
+        if (dist > 0.001) {
+          const weight = 1 / (dist * dist + 0.1);
+          nx += (ddx / dist) * weight;
+          ny += (ddy / dist) * weight;
+        }
+        contacts++;
+        if (DENSITY[mat] > bestDensity || hitMat === EMPTY) {
+          hitMat = mat;
+          bestDensity = DENSITY[mat];
+        }
+      }
+    }
+  }
+
+  if (contacts === 0) return { hit: false };
+
+  const nLen = Math.sqrt(nx * nx + ny * ny);
+  if (nLen < 0.001) { nx = 0; ny = -1; }
+  else { nx /= nLen; ny /= nLen; }
+
+  return { hit: true, mat: hitMat, nx, ny };
+}
+
+function simulateBalls() {
+  for (let i = balls.length - 1; i >= 0; i--) {
+    const ball = balls[i];
+    const props = BALL_TYPES[ball.type];
+    const r = props.radius;
+
+    // Gravity
+    ball.vy += props.gravity;
+
+    // Drag
+    ball.vx *= 0.999;
+    ball.vy *= 0.999;
+
+    // Move
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Wall collisions
+    if (ball.x - r < 0) {
+      ball.x = r;
+      const spd = Math.abs(ball.vx);
+      ball.vx = Math.abs(ball.vx) * props.restitution;
+      if (spd > 0.4) triggerBallImpact(ball, STONE, spd);
+    } else if (ball.x + r > W) {
+      ball.x = W - r;
+      const spd = Math.abs(ball.vx);
+      ball.vx = -Math.abs(ball.vx) * props.restitution;
+      if (spd > 0.4) triggerBallImpact(ball, STONE, spd);
+    }
+    if (ball.y + r > H) {
+      ball.y = H - r;
+      const spd = Math.abs(ball.vy);
+      ball.vy = -Math.abs(ball.vy) * props.restitution;
+      if (spd > 0.4) triggerBallImpact(ball, STONE, spd);
+      if (ball.type === 'water' && spd > 1.0) { burstWaterBall(ball, spd); balls.splice(i, 1); continue; }
+    }
+
+    // Grid collision
+    const col = ballGridCollide(ball.x, ball.y, r);
+    if (col.hit) {
+      for (let step = 0; step < 15; step++) {
+        ball.x += col.nx * 0.4;
+        ball.y += col.ny * 0.4;
+        if (!ballGridCollide(ball.x, ball.y, r).hit) break;
+      }
+
+      const vDotN = ball.vx * col.nx + ball.vy * col.ny;
+      if (vDotN < 0) {
+        const speed = Math.abs(vDotN);
+        ball.vx -= (1 + props.restitution) * vDotN * col.nx;
+        ball.vy -= (1 + props.restitution) * vDotN * col.ny;
+
+        const tx = -col.ny, ty = col.nx;
+        const vDotT = ball.vx * tx + ball.vy * ty;
+        ball.vx -= props.friction * vDotT * tx;
+        ball.vy -= props.friction * vDotT * ty;
+
+        if (speed > 0.3) triggerBallImpact(ball, col.mat, speed);
+
+        if (ball.type === 'water' && speed > 1.0) {
+          burstWaterBall(ball, speed);
+          balls.splice(i, 1);
+          continue;
+        }
+        if (ball.type === 'glass' && speed > 3.5) {
+          shatterGlassBall(ball);
+          balls.splice(i, 1);
+          continue;
+        }
+      }
+    }
+
+    // Settling detection
+    const spd = ball.vx * ball.vx + ball.vy * ball.vy;
+    if (spd < 0.01) ball.restFrames = (ball.restFrames || 0) + 1;
+    else ball.restFrames = 0;
+    if (ball.restFrames > 180) { balls.splice(i, 1); continue; }
+
+    // Off-screen removal
+    if (ball.y > H + 20 || ball.x < -20 || ball.x > W + 20) {
+      balls.splice(i, 1);
+    }
+  }
+
+  // Ball-ball collisions
+  for (let i = 0; i < balls.length; i++) {
+    for (let j = i + 1; j < balls.length; j++) {
+      resolveBallBall(balls[i], balls[j]);
+    }
+  }
+}
+
+function resolveBallBall(a, b) {
+  const pa = BALL_TYPES[a.type], pb = BALL_TYPES[b.type];
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const minDist = pa.radius + pb.radius;
+
+  if (dist >= minDist || dist < 0.001) return;
+
+  const nx = dx / dist, ny = dy / dist;
+  const overlap = minDist - dist;
+
+  const totalMass = pa.mass + pb.mass;
+  a.x -= nx * overlap * (pb.mass / totalMass);
+  a.y -= ny * overlap * (pb.mass / totalMass);
+  b.x += nx * overlap * (pa.mass / totalMass);
+  b.y += ny * overlap * (pa.mass / totalMass);
+
+  const relVx = a.vx - b.vx, relVy = a.vy - b.vy;
+  const relVDotN = relVx * nx + relVy * ny;
+  if (relVDotN > 0) return;
+
+  const e = Math.min(pa.restitution, pb.restitution);
+  const j = -(1 + e) * relVDotN / (1 / pa.mass + 1 / pb.mass);
+
+  a.vx += j * nx / pa.mass;
+  a.vy += j * ny / pa.mass;
+  b.vx -= j * nx / pb.mass;
+  b.vy -= j * ny / pb.mass;
+
+  const speed = Math.abs(relVDotN);
+  if (speed > 0.5 && audioEnabled && !muted) {
+    const harder = pa.mass >= pb.mass ? a : b;
+    triggerBallImpact(harder, METAL, speed * 0.6);
+  }
+}
+
+function burstWaterBall(ball, speed) {
+  if (audioEnabled && !muted) {
+    const pan = (ball.x / W) * 2 - 1;
+    waterSplashSound(pan, audioCtx.currentTime, speed);
+  }
+  const count = Math.min(30, 10 + Math.floor(speed * 4));
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * 5;
+    const gx = Math.round(ball.x + Math.cos(angle) * dist);
+    const gy = Math.round(ball.y + Math.sin(angle) * dist);
+    if (inBounds(gx, gy) && grid[idx(gx, gy)] === EMPTY) {
+      grid[idx(gx, gy)] = WATER;
+    }
+  }
+}
+
+function shatterGlassBall(ball) {
+  if (audioEnabled && !muted) {
+    const pan = (ball.x / W) * 2 - 1;
+    glassShatterSound(pan, audioCtx.currentTime);
+  }
+  const count = 8;
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * 3;
+    const gx = Math.round(ball.x + Math.cos(angle) * dist);
+    const gy = Math.round(ball.y + Math.sin(angle) * dist);
+    if (inBounds(gx, gy) && grid[idx(gx, gy)] === EMPTY) {
+      grid[idx(gx, gy)] = SAND;
+    }
+  }
+}
+
+function spawnBall(type, x, y) {
+  if (balls.length >= MAX_BALLS) return;
+  balls.push({
+    type,
+    x, y,
+    vx: (Math.random() - 0.5) * 0.4,
+    vy: 0,
+    restFrames: 0,
+  });
+}
+
+// ==================== BPM EMITTER SYSTEM ====================
+function findEmitterAt(gx, gy) {
+  const threshold = 5;
+  for (let i = 0; i < emitters.length; i++) {
+    const dx = emitters[i].x - gx;
+    const dy = emitters[i].y - gy;
+    if (dx * dx + dy * dy < threshold * threshold) return i;
+  }
+  return -1;
+}
+
+function placeEmitter(gx, gy, ballType) {
+  if (emitters.length >= MAX_EMITTERS) return;
+  // Don't place on top of an existing emitter
+  if (findEmitterAt(gx, gy) >= 0) return;
+  emitters.push({
+    x: gx,
+    y: gy,
+    ballType: ballType || 'steel',
+    division: 4, // default quarter note
+    lastFireIndex: -1,
+    flash: 0,
+  });
+  updateEmitterCount();
+}
+
+function removeEmitter(index) {
+  emitters.splice(index, 1);
+  updateEmitterCount();
+}
+
+function cycleEmitterDivision(index, direction) {
+  const em = emitters[index];
+  const curIdx = DIVISIONS.indexOf(em.division);
+  const newIdx = Math.max(0, Math.min(DIVISIONS.length - 1, curIdx + direction));
+  em.division = DIVISIONS[newIdx];
+}
+
+function cycleEmitterBallType(index) {
+  const em = emitters[index];
+  const curIdx = BALL_ORDER.indexOf(em.ballType);
+  em.ballType = BALL_ORDER[(curIdx + 1) % BALL_ORDER.length];
+}
+
+function tickEmitters() {
+  if (!bpmPlaying || paused || emitters.length === 0) {
+    lastTickTime = 0;
+    return;
+  }
+
+  const now = performance.now() / 1000;
+  if (lastTickTime === 0) { lastTickTime = now; return; }
+
+  const dt = Math.min(now - lastTickTime, 0.1);
+  lastTickTime = now;
+
+  const beatsPerSecond = bpm / 60;
+  beatAccumulator += dt * beatsPerSecond;
+
+  // Update beat indicator
+  const newBeat = Math.floor(beatAccumulator) % 4;
+  if (newBeat !== currentBeat) {
+    currentBeat = newBeat;
+    updateBeatIndicator();
+    // Flash canvas border on downbeat
+    if (currentBeat === 0) {
+      canvas.classList.add('beat-flash');
+      setTimeout(() => canvas.classList.remove('beat-flash'), 80);
+    }
+  }
+
+  // Fire emitters
+  for (const em of emitters) {
+    const beatsPerFire = 4 / em.division;
+    const fireIndex = Math.floor(beatAccumulator / beatsPerFire);
+    if (fireIndex > em.lastFireIndex) {
+      em.lastFireIndex = fireIndex;
+      spawnBall(em.ballType, em.x + 0.5, em.y + 0.5);
+      em.flash = 10;
+    }
+  }
+}
+
+function startBpm() {
+  if (!audioEnabled) initAudio();
+  bpmPlaying = true;
+  beatAccumulator = 0;
+  lastTickTime = 0;
+  currentBeat = -1;
+  for (const em of emitters) em.lastFireIndex = -1;
+  updatePlayButton();
+  updateBeatIndicator();
+}
+
+function stopBpm() {
+  bpmPlaying = false;
+  beatAccumulator = 0;
+  lastTickTime = 0;
+  currentBeat = -1;
+  for (const em of emitters) em.lastFireIndex = -1;
+  updatePlayButton();
+  updateBeatIndicator();
+}
+
+function toggleBpm() {
+  if (bpmPlaying) stopBpm();
+  else startBpm();
+}
+
+function setBpm(newBpm) {
+  bpm = Math.max(40, Math.min(300, Math.round(newBpm)));
+  document.getElementById('bpm-input').value = bpm;
+}
+
+function updatePlayButton() {
+  const btn = document.getElementById('bpm-play');
+  if (bpmPlaying) {
+    btn.textContent = '\u23F8 Stop';
+    btn.classList.add('playing');
+  } else {
+    btn.textContent = '\u25B6 Play';
+    btn.classList.remove('playing');
+  }
+}
+
+function updateBeatIndicator() {
+  for (let i = 0; i < 4; i++) {
+    const dot = document.getElementById('bd' + i);
+    dot.classList.remove('active', 'downbeat');
+    if (i === currentBeat) {
+      dot.classList.add(i === 0 ? 'downbeat' : 'active');
+    }
+  }
+}
+
+function updateEmitterCount() {
+  document.getElementById('emitter-count').textContent = emitters.length + ' emitter' + (emitters.length !== 1 ? 's' : '');
+}
+
+function renderEmitters() {
+  for (const em of emitters) {
+    const props = BALL_TYPES[em.ballType];
+    const cx = em.x * SCALE;
+    const cy = em.y * SCALE;
+    const [R, G, B] = props.color;
+    const s = SCALE * 1.8;
+
+    // Glow pulse when firing
+    if (em.flash > 0) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, s * 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${R},${G},${B},${em.flash * 0.025})`;
+      ctx.fill();
+      em.flash--;
+    }
+
+    // Funnel shape: trapezoid pointing down
+    ctx.beginPath();
+    ctx.moveTo(cx - s, cy - s * 0.6);
+    ctx.lineTo(cx + s, cy - s * 0.6);
+    ctx.lineTo(cx + s * 0.25, cy + s * 0.8);
+    ctx.lineTo(cx - s * 0.25, cy + s * 0.8);
+    ctx.closePath();
+
+    const alpha = em.flash > 0 ? 0.9 : 0.65;
+    ctx.fillStyle = `rgba(${R},${G},${B},${alpha})`;
+    ctx.fill();
+    ctx.strokeStyle = em.flash > 0 ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = em.flash > 0 ? 1.5 : 1;
+    ctx.stroke();
+
+    // Small ball indicator inside funnel
+    ctx.beginPath();
+    ctx.arc(cx, cy - s * 0.1, s * 0.25, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,0.5)`;
+    ctx.fill();
+
+    // Division label above
+    ctx.fillStyle = '#fff';
+    ctx.font = (SCALE * 3) + 'px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(DIV_LABELS[em.division], cx, cy - s * 0.6 - 2);
+  }
+}
+
+// ==================== AUDIO ENGINE ====================
+let audioCtx = null;
+let masterGain = null;
+let compressor = null;
+let noiseBuffer = null;
+let audioEnabled = false;
+let muted = false;
+let sandFlowGain = null;
+let waterFlowGain = null;
+
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  compressor = audioCtx.createDynamicsCompressor();
+  compressor.threshold.value = -18;
+  compressor.knee.value = 10;
+  compressor.ratio.value = 8;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.08;
+
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = parseInt(document.getElementById('vol').value) / 100;
+
+  compressor.connect(masterGain);
+  masterGain.connect(audioCtx.destination);
+
+  // White noise buffer (2 seconds)
+  const sr = audioCtx.sampleRate;
+  noiseBuffer = audioCtx.createBuffer(1, sr * 2, sr);
+  const d = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+
+  // Flow sounds
+  setupFlowSound('highpass', 3000, 0.5, g => { sandFlowGain = g; });
+  setupFlowSound('lowpass', 600, 1.0, g => { waterFlowGain = g; });
+
+  audioEnabled = true;
+  document.getElementById('audio-badge').className = 'on';
+  document.getElementById('audio-badge').textContent = 'audio on';
+}
+
+function setupFlowSound(filterType, freq, Q, assignGain) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  src.loop = true;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = filterType;
+  flt.frequency.value = freq;
+  flt.Q.value = Q;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0;
+  src.connect(flt); flt.connect(gain); gain.connect(compressor);
+  src.start();
+  assignGain(gain);
+}
+
+// ---- Grid particle impact sounds ----
+
+const MAX_TRIGGERS = 30;
+
+function processGridAudio() {
+  if (!audioEnabled || !audioCtx || muted) return;
+  soundsThisFrame = 0;
+
+  const eventCount = collisions.length;
+  for (let i = 0; i < eventCount && soundsThisFrame < MAX_TRIGGERS; i++) {
+    if (eventCount > MAX_TRIGGERS && Math.random() > MAX_TRIGGERS / eventCount) continue;
+    triggerCollisionSound(collisions[i]);
+    soundsThisFrame++;
+  }
+
+  const now = audioCtx.currentTime;
+  const sf = Math.min(1, sandFlowCount / 400) * 0.07;
+  const wf = Math.min(1, waterFlowCount / 250) * 0.05;
+  sandFlowGain.gain.setTargetAtTime(sf, now, 0.06);
+  waterFlowGain.gain.setTargetAtTime(wf, now, 0.06);
+}
+
+function triggerCollisionSound(evt) {
+  const { x, y, impactor, surface } = evt;
+  const pan = (x / W) * 2 - 1;
+  const now = audioCtx.currentTime;
+
+  switch (surface) {
+    case METAL: triggerMetalPing(x, y, pan, now, impactor); break;
+    case GLASS: triggerGlassChime(x, y, pan, now, impactor); break;
+    case STONE: noiseImpact(pan, now, 300, 0.4, 0.022, 0.05); break;
+    case WOOD:  noiseImpact(pan, now, 700, 1.8, 0.04, 0.045); break;
+    case SAND:  noiseImpact(pan, now, 5000, 0.7, 0.008, 0.015); break;
+    case WATER: noiseImpact(pan, now, 400, 4.0, 0.055, 0.035); break;
+    default:    noiseImpact(pan, now, 300, 0.4, 0.022, 0.04);
+  }
+}
+
+function noiseImpact(pan, time, freq, Q, decay, vol) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = 'bandpass';
+  flt.frequency.value = freq + (Math.random() - 0.5) * freq * 0.2;
+  flt.Q.value = Q;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + decay);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+  src.connect(flt); flt.connect(g); g.connect(p); p.connect(compressor);
+  src.start(time);
+  src.stop(time + decay + 0.01);
+  src.onended = () => { src.disconnect(); flt.disconnect(); g.disconnect(); p.disconnect(); };
+}
+
+function triggerMetalPing(x, y, pan, time, impactor) {
+  const noteIdx = Math.floor(((H - y) / H) * PENTA_FREQS.length);
+  const fundamental = PENTA_FREQS[Math.min(noteIdx, PENTA_FREQS.length - 1)];
+  const vol = impactor === WATER ? 0.035 : 0.045;
+  const decay = 0.45;
+  noiseImpact(pan, time, 2500, 1.0, 0.004, vol * 0.5);
+  const harmonics = [1, 2.76, 5.40];
+  for (const ratio of harmonics) {
+    const freq = fundamental * ratio;
+    if (freq > 12000) continue;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq + (Math.random() - 0.5) * 2;
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(vol / (1 + ratio * 0.4), time);
+    g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan;
+    osc.connect(g); g.connect(p); p.connect(compressor);
+    osc.start(time); osc.stop(time + decay + 0.02);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+  }
+}
+
+function triggerGlassChime(x, y, pan, time, impactor) {
+  const noteIdx = Math.floor(((H - y) / H) * GLASS_FREQS.length);
+  const fundamental = GLASS_FREQS[Math.min(noteIdx, GLASS_FREQS.length - 1)];
+  const vol = impactor === WATER ? 0.025 : 0.035;
+  const decay = 0.28;
+  noiseImpact(pan, time, 7000, 0.5, 0.003, vol * 0.4);
+  const harmonics = [1, 2.32, 4.5];
+  for (const ratio of harmonics) {
+    const freq = fundamental * ratio;
+    if (freq > 16000) continue;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq + (Math.random() - 0.5) * 3;
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(vol / (1 + ratio * 0.5), time);
+    g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan;
+    osc.connect(g); g.connect(p); p.connect(compressor);
+    osc.start(time); osc.stop(time + decay + 0.02);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+  }
+}
+
+// ---- Ball impact sounds ----
+
+function triggerBallImpact(ball, surfaceMat, speed) {
+  if (!audioEnabled || !audioCtx || muted) return;
+  const pan = (ball.x / W) * 2 - 1;
+  const now = audioCtx.currentTime;
+
+  switch (ball.type) {
+    case 'steel':  steelImpactSound(pan, now, speed, surfaceMat, ball.y); break;
+    case 'glass':  glassImpactSound(pan, now, speed, surfaceMat, ball.y); break;
+    case 'rubber': rubberImpactSound(pan, now, speed, surfaceMat); break;
+    case 'water':  waterDripSound(pan, now, speed); break;
+  }
+}
+
+function steelImpactSound(pan, time, speed, surfaceMat, y) {
+  const speedN = Math.min(speed, 6);
+  const vol = Math.min(0.09, speedN * 0.018);
+  const decay = 0.3 + speedN * 0.06;
+
+  noiseImpact(pan, time, 2000 + speedN * 300, 1.5, 0.005, vol * 0.5);
+
+  const noteIdx = Math.floor(((H - y) / H) * PENTA_FREQS.length);
+  const fundamental = PENTA_FREQS[Math.min(noteIdx, PENTA_FREQS.length - 1)];
+
+  const carrier = audioCtx.createOscillator();
+  carrier.type = 'sine';
+  carrier.frequency.value = fundamental;
+
+  const modulator = audioCtx.createOscillator();
+  modulator.type = 'sine';
+  modulator.frequency.value = fundamental * 2.76;
+
+  const modGain = audioCtx.createGain();
+  modGain.gain.setValueAtTime(fundamental * (1.5 + speedN * 0.5), time);
+  modGain.gain.exponentialRampToValueAtTime(0.01, time + decay);
+
+  modulator.connect(modGain);
+  modGain.connect(carrier.frequency);
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+
+  carrier.connect(g); g.connect(p); p.connect(compressor);
+  modulator.start(time); carrier.start(time);
+  modulator.stop(time + decay + 0.02); carrier.stop(time + decay + 0.02);
+  carrier.onended = () => { carrier.disconnect(); modulator.disconnect(); modGain.disconnect(); g.disconnect(); p.disconnect(); };
+
+  if (surfaceMat === METAL || surfaceMat === GLASS || surfaceMat === STONE) {
+    const osc2 = audioCtx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.value = fundamental * 5.4 + (Math.random() - 0.5) * 5;
+    const g2 = audioCtx.createGain();
+    g2.gain.setValueAtTime(vol * 0.25, time);
+    g2.gain.exponentialRampToValueAtTime(0.00001, time + decay * 0.5);
+    const p2 = audioCtx.createStereoPanner();
+    p2.pan.value = pan;
+    osc2.connect(g2); g2.connect(p2); p2.connect(compressor);
+    osc2.start(time); osc2.stop(time + decay * 0.5 + 0.02);
+    osc2.onended = () => { osc2.disconnect(); g2.disconnect(); p2.disconnect(); };
+  }
+}
+
+function glassImpactSound(pan, time, speed, surfaceMat, y) {
+  const speedN = Math.min(speed, 5);
+  const vol = Math.min(0.07, speedN * 0.015);
+  const decay = 0.22 + speedN * 0.03;
+
+  noiseImpact(pan, time, 6000 + speedN * 500, 0.4, 0.003, vol * 0.4);
+
+  const noteIdx = Math.floor(((H - y) / H) * GLASS_FREQS.length);
+  const fundamental = GLASS_FREQS[Math.min(noteIdx, GLASS_FREQS.length - 1)];
+
+  const harmonics = [1, 2.32, 4.5, 6.8];
+  for (const ratio of harmonics) {
+    const freq = fundamental * ratio;
+    if (freq > 16000) continue;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq + (Math.random() - 0.5) * 4;
+    const g = audioCtx.createGain();
+    const hVol = vol / (1 + ratio * 0.35);
+    g.gain.setValueAtTime(hVol, time);
+    g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan;
+    osc.connect(g); g.connect(p); p.connect(compressor);
+    osc.start(time); osc.stop(time + decay + 0.02);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+  }
+}
+
+function rubberImpactSound(pan, time, speed, surfaceMat) {
+  const speedN = Math.min(speed, 6);
+  const vol = Math.min(0.08, speedN * 0.016);
+
+  noiseImpact(pan, time, 120 + speedN * 30, 3.5, 0.02, vol);
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(70 + speedN * 12, time);
+  osc.frequency.exponentialRampToValueAtTime(40, time + 0.06);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol * 0.7, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.07);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+  osc.connect(g); g.connect(p); p.connect(compressor);
+  osc.start(time); osc.stop(time + 0.09);
+  osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+
+  if (surfaceMat === METAL) {
+    noiseImpact(pan, time, 2000, 2.0, 0.015, vol * 0.15);
+  } else if (surfaceMat === GLASS) {
+    noiseImpact(pan, time, 5000, 1.0, 0.01, vol * 0.1);
+  }
+}
+
+function waterDripSound(pan, time, speed) {
+  const speedN = Math.min(speed, 4);
+  const vol = Math.min(0.05, speedN * 0.015);
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  const bubbleFreq = 200 + speedN * 80 + Math.random() * 100;
+  osc.frequency.setValueAtTime(bubbleFreq, time);
+  osc.frequency.exponentialRampToValueAtTime(bubbleFreq * 0.5, time + 0.06);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.08);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+  osc.connect(g); g.connect(p); p.connect(compressor);
+  osc.start(time); osc.stop(time + 0.1);
+  osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+}
+
+function waterSplashSound(pan, time, speed) {
+  const speedN = Math.min(speed, 6);
+  const vol = Math.min(0.12, speedN * 0.025);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = 'bandpass';
+  flt.frequency.setValueAtTime(800 + speedN * 200, time);
+  flt.frequency.exponentialRampToValueAtTime(150, time + 0.35);
+  flt.Q.value = 1.5;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.4);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+  src.connect(flt); flt.connect(g); g.connect(p); p.connect(compressor);
+  src.start(time); src.stop(time + 0.45);
+  src.onended = () => { src.disconnect(); flt.disconnect(); g.disconnect(); p.disconnect(); };
+
+  const bubbleCount = 3 + Math.floor(speedN);
+  for (let i = 0; i < bubbleCount; i++) {
+    const delay = Math.random() * 0.2;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    const bFreq = 150 + Math.random() * 300;
+    osc.frequency.setValueAtTime(bFreq, time + delay);
+    osc.frequency.exponentialRampToValueAtTime(bFreq * 0.55, time + delay + 0.09);
+    const g2 = audioCtx.createGain();
+    g2.gain.setValueAtTime(0.0001, time);
+    g2.gain.linearRampToValueAtTime(vol * 0.25, time + delay);
+    g2.gain.exponentialRampToValueAtTime(0.0001, time + delay + 0.1);
+    const p2 = audioCtx.createStereoPanner();
+    p2.pan.value = pan + (Math.random() - 0.5) * 0.3;
+    osc.connect(g2); g2.connect(p2); p2.connect(compressor);
+    osc.start(time); osc.stop(time + delay + 0.15);
+    osc.onended = () => { osc.disconnect(); g2.disconnect(); p2.disconnect(); };
+  }
+}
+
+function glassShatterSound(pan, time) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = 'bandpass';
+  flt.Q.value = 2;
+  flt.frequency.setValueAtTime(8000, time);
+  flt.frequency.exponentialRampToValueAtTime(300, time + 0.4);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.12, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.5);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+  src.connect(flt); flt.connect(g); g.connect(p); p.connect(compressor);
+  src.start(time); src.stop(time + 0.55);
+  src.onended = () => { src.disconnect(); flt.disconnect(); g.disconnect(); p.disconnect(); };
+
+  for (let i = 0; i < 5; i++) {
+    const delay = Math.random() * 0.2;
+    const freq = 2000 + Math.random() * 4000;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const g2 = audioCtx.createGain();
+    g2.gain.setValueAtTime(0.0001, time);
+    g2.gain.linearRampToValueAtTime(0.04, time + delay + 0.002);
+    g2.gain.exponentialRampToValueAtTime(0.0001, time + delay + 0.15);
+    const p2 = audioCtx.createStereoPanner();
+    p2.pan.value = pan + (Math.random() - 0.5) * 0.4;
+    osc.connect(g2); g2.connect(p2); p2.connect(compressor);
+    osc.start(time); osc.stop(time + delay + 0.2);
+    osc.onended = () => { osc.disconnect(); g2.disconnect(); p2.disconnect(); };
+  }
+}
+
+// ==================== RENDERING ====================
+function varyColor(base, amount) {
+  const v = (Math.random() - 0.5) * amount * 2;
+  return [
+    Math.max(0, Math.min(255, base[0] + v)) | 0,
+    Math.max(0, Math.min(255, base[1] + v)) | 0,
+    Math.max(0, Math.min(255, base[2] + v)) | 0,
+  ];
+}
+
+function matColor(mat) {
+  switch (mat) {
+    case SAND:  return varyColor([210, 180, 100], 15);
+    case WATER: return varyColor([40, 80, 200], 20);
+    case STONE: return varyColor([120, 120, 130], 10);
+    case METAL: return varyColor([170, 175, 182], 6);
+    case GLASS: return varyColor([180, 215, 250], 8);
+    case WOOD:  return varyColor([100, 65, 30], 10);
+    default:    return [26, 26, 46];
+  }
+}
+
+function render() {
+  // Grid pixels
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+      if (mat === EMPTY) {
+        pixels[i] = 0xFF2E1A1A;
+      } else {
+        const c = matColor(mat);
+        pixels[i] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+      }
+    }
+  }
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+
+  // Balls (drawn on scaled canvas)
+  for (const ball of balls) {
+    const props = BALL_TYPES[ball.type];
+    const cx = ball.x * SCALE;
+    const cy = ball.y * SCALE;
+    const r = props.radius * SCALE;
+    const [R, G, B] = props.color;
+
+    // Shadow
+    ctx.beginPath();
+    ctx.arc(cx + 1.5, cy + 1.5, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fill();
+
+    // Body
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    if (ball.type === 'glass') {
+      ctx.fillStyle = `rgba(${R},${G},${B},0.35)`;
+      ctx.fill();
+      ctx.strokeStyle = `rgba(${R},${G},${B},0.7)`;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if (ball.type === 'water') {
+      const grad = ctx.createRadialGradient(cx - r * 0.2, cy - r * 0.2, 0, cx, cy, r);
+      grad.addColorStop(0, `rgba(${R+60},${G+40},${B+30},0.85)`);
+      grad.addColorStop(1, `rgba(${R},${G},${B},0.7)`);
+      ctx.fillStyle = grad;
+      ctx.fill();
+    } else {
+      ctx.fillStyle = `rgb(${R},${G},${B})`;
+      ctx.fill();
+    }
+
+    // Highlight
+    ctx.beginPath();
+    ctx.arc(cx - r * 0.25, cy - r * 0.3, r * 0.35, 0, Math.PI * 2);
+    ctx.fillStyle = props.highlight;
+    ctx.fill();
+
+    if (ball.type === 'steel') {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(80,85,100,0.4)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // Emitters (drawn on top of everything)
+  renderEmitters();
+}
+
+// ==================== INPUT ====================
+function canvasToGrid(e) {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    Math.floor((e.clientX - rect.left) / SCALE),
+    Math.floor((e.clientY - rect.top) / SCALE),
+  ];
+}
+
+function paint() {
+  const mat = rightDown ? EMPTY : material;
+  for (let dy = -brushSize; dy <= brushSize; dy++) {
+    for (let dx = -brushSize; dx <= brushSize; dx++) {
+      if (dx * dx + dy * dy > brushSize * brushSize) continue;
+      const px = mouseX + dx, py = mouseY + dy;
+      if (!inBounds(px, py)) continue;
+      const i = idx(px, py);
+      if (mat === EMPTY) {
+        grid[i] = EMPTY;
+      } else if (grid[i] === EMPTY) {
+        grid[i] = mat;
+      }
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  if (!audioEnabled) initAudio();
+  const [gx, gy] = canvasToGrid(e);
+
+  if (emitterMode) {
+    if (e.button === 2) {
+      // Right-click: remove emitter
+      const ei = findEmitterAt(gx, gy);
+      if (ei >= 0) removeEmitter(ei);
+    } else {
+      // Left-click: place or cycle existing emitter's ball type
+      const ei = findEmitterAt(gx, gy);
+      if (ei >= 0) {
+        cycleEmitterBallType(ei);
+      } else {
+        const ballType = selectedBall || 'steel';
+        placeEmitter(gx, gy, ballType);
+      }
+    }
+    return;
+  }
+
+  if (e.button === 2) {
+    rightDown = true;
+    [mouseX, mouseY] = [gx, gy];
+    paint();
+  } else {
+    if (selectedBall) {
+      spawnBall(selectedBall, gx + 0.5, gy + 0.5);
+    } else {
+      mouseDown = true;
+      [mouseX, mouseY] = [gx, gy];
+      paint();
+    }
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  [mouseX, mouseY] = canvasToGrid(e);
+  if (mouseDown) paint();
+  if (rightDown) paint();
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button === 2) rightDown = false;
+  else mouseDown = false;
+});
+canvas.addEventListener('mouseleave', () => { mouseDown = false; rightDown = false; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const [gx, gy] = canvasToGrid(e);
+
+  // If over an emitter, change its division
+  const ei = findEmitterAt(gx, gy);
+  if (ei >= 0) {
+    cycleEmitterDivision(ei, e.deltaY > 0 ? -1 : 1);
+    return;
+  }
+
+  // Otherwise change brush size
+  brushSize = Math.max(1, Math.min(12, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = 'Brush: ' + brushSize;
+}, { passive: false });
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k >= '0' && k <= '6') {
+    material = parseInt(k);
+    selectedBall = null;
+    emitterMode = false;
+    updateToolbar();
+  } else if (k === 'z') { selectedBall = 'steel'; updateToolbar(); }
+  else if (k === 'x') { selectedBall = 'glass'; updateToolbar(); }
+  else if (k === 'v') { selectedBall = 'rubber'; updateToolbar(); }
+  else if (k === 'b') { selectedBall = 'water'; updateToolbar(); }
+  else if (k === 'e') {
+    emitterMode = !emitterMode;
+    if (emitterMode && !selectedBall) selectedBall = 'steel';
+    updateToolbar();
+  }
+  else if (k === 'enter') { e.preventDefault(); toggleBpm(); }
+  else if (k === '[') { setBpm(bpm - 5); }
+  else if (k === ']') { setBpm(bpm + 5); }
+  else if (k === 'p') { generatePlinko(); }
+  else if (k === ' ') { e.preventDefault(); paused = !paused; }
+  else if (k === 'c') {
+    grid.fill(0);
+    movedPrev.fill(0);
+    movedCur.fill(0);
+    balls.length = 0;
+    emitters.length = 0;
+    stopBpm();
+    updateEmitterCount();
+  }
+  else if (k === 'm') {
+    muted = !muted;
+    if (audioEnabled) {
+      const badge = document.getElementById('audio-badge');
+      badge.textContent = muted ? 'muted' : 'audio on';
+      badge.className = muted ? 'off' : 'on';
+      if (muted) {
+        sandFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+        waterFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+      }
+    }
+  }
+});
+
+document.getElementById('vol').addEventListener('input', e => {
+  if (masterGain) masterGain.gain.value = parseInt(e.target.value) / 100;
+});
+
+document.getElementById('audio-badge').addEventListener('click', () => {
+  if (!audioEnabled) initAudio();
+  else {
+    muted = !muted;
+    const badge = document.getElementById('audio-badge');
+    badge.textContent = muted ? 'muted' : 'audio on';
+    badge.className = muted ? 'off' : 'on';
+    if (muted && sandFlowGain) {
+      sandFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+      waterFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+    }
+  }
+});
+
+// ==================== BPM CONTROLS ====================
+document.getElementById('bpm-play').addEventListener('click', toggleBpm);
+document.getElementById('bpm-down').addEventListener('click', () => setBpm(bpm - 5));
+document.getElementById('bpm-up').addEventListener('click', () => setBpm(bpm + 5));
+document.getElementById('bpm-input').addEventListener('change', e => {
+  setBpm(parseInt(e.target.value) || 120);
+});
+document.getElementById('bpm-input').addEventListener('keydown', e => {
+  e.stopPropagation(); // prevent global key handlers while editing BPM
+});
+
+// ==================== TOOLBAR ====================
+function buildToolbar() {
+  const tb = document.getElementById('toolbar');
+
+  // Material buttons
+  MAT_INFO.forEach((m, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn' + (i === material && !selectedBall && !emitterMode ? ' active' : '');
+    btn.dataset.mat = i;
+    const [r, g, b] = m.rgb;
+    const bg = i === 0 ? '#333' : `rgb(${r},${g},${b})`;
+    btn.innerHTML = `<div class="swatch" style="background:${bg}"></div><span>${m.name}</span><span class="key">${m.key}</span>`;
+    btn.addEventListener('click', () => {
+      if (!audioEnabled) initAudio();
+      material = i;
+      selectedBall = null;
+      emitterMode = false;
+      updateToolbar();
+    });
+    tb.appendChild(btn);
+  });
+
+  // Separator
+  tb.appendChild(Object.assign(document.createElement('div'), { className: 'sep' }));
+
+  // Ball type buttons
+  BALL_ORDER.forEach(type => {
+    const bt = BALL_TYPES[type];
+    const btn = document.createElement('button');
+    btn.className = 'btn' + (selectedBall === type && !emitterMode ? ' ball-active' : '');
+    btn.dataset.ball = type;
+    const [r, g, b] = bt.color;
+    btn.innerHTML = `<div class="ball-swatch" style="background:rgb(${r},${g},${b})"></div><span>${bt.name}</span><span class="key">${bt.key}</span>`;
+    btn.addEventListener('click', () => {
+      if (!audioEnabled) initAudio();
+      selectedBall = type;
+      emitterMode = false;
+      updateToolbar();
+    });
+    tb.appendChild(btn);
+  });
+
+  // Separator
+  tb.appendChild(Object.assign(document.createElement('div'), { className: 'sep' }));
+
+  // Emitter mode button
+  const emBtn = document.createElement('button');
+  emBtn.className = 'btn' + (emitterMode ? ' emitter-active' : '');
+  emBtn.id = 'emitter-btn';
+  emBtn.innerHTML = `<div class="ball-swatch" style="background:linear-gradient(135deg,#a0accc,#c83838,#3268dc);border:1px solid #f66"></div><span>Emitter</span><span class="key">E</span>`;
+  emBtn.addEventListener('click', () => {
+    if (!audioEnabled) initAudio();
+    emitterMode = !emitterMode;
+    if (emitterMode && !selectedBall) selectedBall = 'steel';
+    updateToolbar();
+  });
+  tb.appendChild(emBtn);
+
+  // Separator
+  tb.appendChild(Object.assign(document.createElement('div'), { className: 'sep' }));
+
+  // Plinko preset button
+  const pBtn = document.createElement('button');
+  pBtn.className = 'preset-btn';
+  pBtn.textContent = 'Plinko (P)';
+  pBtn.addEventListener('click', () => {
+    if (!audioEnabled) initAudio();
+    generatePlinko();
+  });
+  tb.appendChild(pBtn);
+
+  // Separator + brush label
+  tb.appendChild(Object.assign(document.createElement('div'), { className: 'sep' }));
+  const bl = document.createElement('span');
+  bl.id = 'brush-label';
+  bl.style.fontSize = '11px';
+  bl.style.color = '#888';
+  bl.textContent = 'Brush: ' + brushSize;
+  tb.appendChild(bl);
+}
+
+function updateToolbar() {
+  // Material buttons
+  document.querySelectorAll('.btn[data-mat]').forEach(btn => {
+    const i = parseInt(btn.dataset.mat);
+    btn.classList.remove('active', 'ball-active', 'emitter-active');
+    if (i === material && !selectedBall && !emitterMode) btn.classList.add('active');
+  });
+  // Ball buttons
+  document.querySelectorAll('.btn[data-ball]').forEach(btn => {
+    btn.classList.remove('active', 'ball-active', 'emitter-active');
+    if (btn.dataset.ball === selectedBall && !emitterMode) btn.classList.add('ball-active');
+  });
+  // Emitter button
+  const emBtn = document.getElementById('emitter-btn');
+  if (emBtn) {
+    emBtn.classList.remove('active', 'ball-active', 'emitter-active');
+    if (emitterMode) emBtn.classList.add('emitter-active');
+  }
+  // Cursor hint
+  if (emitterMode) {
+    canvas.style.cursor = 'cell';
+  } else if (selectedBall) {
+    canvas.style.cursor = 'pointer';
+  } else {
+    canvas.style.cursor = 'crosshair';
+  }
+}
+
+// ==================== PRESETS ====================
+function generatePlinko() {
+  grid.fill(EMPTY);
+  movedPrev.fill(0);
+  movedCur.fill(0);
+  balls.length = 0;
+  emitters.length = 0;
+
+  const pegR = 2;
+  const spacingX = 16;
+  const spacingY = 13;
+  const startY = 30;
+  const endY = 155;
+  const centerX = Math.floor(W / 2);
+  const boardHalfW = 100;
+
+  // Staggered peg rows
+  let row = 0;
+  for (let y = startY; y <= endY; y += spacingY) {
+    const offset = (row % 2) * Math.floor(spacingX / 2);
+    for (let cx = centerX - boardHalfW + offset; cx <= centerX + boardHalfW; cx += spacingX) {
+      const px = Math.round(cx);
+      for (let dy = -pegR; dy <= pegR; dy++) {
+        for (let dx = -pegR; dx <= pegR; dx++) {
+          if (dx * dx + dy * dy <= pegR * pegR) {
+            const gx = px + dx, gy = y + dy;
+            if (inBounds(gx, gy)) grid[idx(gx, gy)] = METAL;
+          }
+        }
+      }
+    }
+    row++;
+  }
+
+  // Bottom dividers (wooden)
+  const slotY = endY + spacingY;
+  for (let cx = centerX - boardHalfW; cx <= centerX + boardHalfW; cx += spacingX) {
+    const px = Math.round(cx);
+    for (let y = slotY; y < H - 2; y++) {
+      if (inBounds(px, y)) grid[idx(px, y)] = WOOD;
+    }
+  }
+
+  // Side walls
+  const wallLeft = Math.round(centerX - boardHalfW - 6);
+  const wallRight = Math.round(centerX + boardHalfW + 6);
+  for (let y = startY - 8; y < H; y++) {
+    for (let dx = 0; dx < 3; dx++) {
+      if (inBounds(wallLeft + dx, y)) grid[idx(wallLeft + dx, y)] = STONE;
+      if (inBounds(wallRight - dx, y)) grid[idx(wallRight - dx, y)] = STONE;
+    }
+  }
+
+  // Funnel walls at top to guide balls
+  for (let i = 0; i < 15; i++) {
+    const ly = startY - 8 + i;
+    const lx = wallLeft + 3 + (15 - i);
+    const rx = wallRight - 3 - (15 - i);
+    if (inBounds(lx, ly)) grid[idx(lx, ly)] = STONE;
+    if (inBounds(lx + 1, ly)) grid[idx(lx + 1, ly)] = STONE;
+    if (inBounds(rx, ly)) grid[idx(rx, ly)] = STONE;
+    if (inBounds(rx - 1, ly)) grid[idx(rx - 1, ly)] = STONE;
+  }
+
+  // Floor
+  for (let x = 0; x < W; x++) {
+    for (let y = H - 2; y < H; y++) {
+      grid[idx(x, y)] = STONE;
+    }
+  }
+
+  // Place BPM emitters at the top of the funnel
+  const emitterY = 12;
+  emitters.push({ x: centerX - 24, y: emitterY, ballType: 'steel',  division: 4,  lastFireIndex: -1, flash: 0 });
+  emitters.push({ x: centerX,      y: emitterY, ballType: 'glass',  division: 8,  lastFireIndex: -1, flash: 0 });
+  emitters.push({ x: centerX + 24, y: emitterY, ballType: 'rubber', division: 4,  lastFireIndex: -1, flash: 0 });
+
+  // Auto-select emitter mode so user can tweak right away
+  selectedBall = 'steel';
+  emitterMode = false;
+  updateToolbar();
+  updateEmitterCount();
+
+  // Stop BPM if it was running
+  if (bpmPlaying) stopBpm();
+}
+
+// ==================== MAIN LOOP ====================
+let particleCount = 0;
+
+function countParticles() {
+  let c = 0;
+  for (let i = 0; i < grid.length; i++) if (grid[i] !== EMPTY) c++;
+  return c;
+}
+
+function loop() {
+  if (!paused) {
+    tickEmitters();
+    simulate();
+    simulateBalls();
+    processGridAudio();
+  }
+  render();
+
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime > 500) {
+    currentFps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
+    frameCount = 0;
+    lastFpsTime = now;
+    particleCount = countParticles();
+    document.getElementById('fps').textContent = currentFps + ' fps';
+    document.getElementById('particles').textContent = particleCount + ' particles';
+    document.getElementById('ball-count').textContent = balls.length + ' balls';
+    document.getElementById('collisions-display').textContent = soundsThisFrame + ' sounds';
+  }
+
+  requestAnimationFrame(loop);
+}
+
+buildToolbar();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

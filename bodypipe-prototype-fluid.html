@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bodypipe</title>
+<style>
+* { margin: 0; padding: 0; }
+body { background: #f5f0e8; overflow: hidden; font-family: monospace; }
+#canvas { display: block; width: 100vw; height: 100vh; }
+#video { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0.001; pointer-events: none; z-index: -1; }
+#overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px;
+  pointer-events: none; z-index: 10;
+}
+#startBtn {
+  pointer-events: auto; padding: 14px 28px; font-size: 15px;
+  font-family: monospace; cursor: pointer; background: none;
+  border: 1px solid #555; color: #444; border-radius: 4px;
+  transition: all 0.2s;
+}
+#startBtn:hover { background: rgba(0,0,0,0.04); border-color: #333; }
+#status { font-size: 11px; color: #999; pointer-events: none; }
+#debug {
+  position: fixed; top: 8px; left: 8px; font-size: 11px;
+  color: #999; z-index: 20; display: none;
+}
+#hint {
+  position: fixed; bottom: 12px; right: 12px; font-size: 10px;
+  color: #bbb; z-index: 20;
+}
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<video id="video" playsinline muted></video>
+<div id="overlay">
+  <div id="status"></div>
+  <button id="startBtn">start camera</button>
+  <label id="fileLabel" style="pointer-events:auto;padding:14px 28px;font-size:15px;font-family:monospace;cursor:pointer;background:none;border:1px solid #555;color:#444;border-radius:4px;transition:all 0.2s;display:inline-block;">
+    load video file
+    <input type="file" id="fileInput" accept="video/*" style="position:absolute;opacity:0;width:0;height:0;overflow:hidden;">
+  </label>
+</div>
+<div id="debug"></div>
+<div id="hint">d: debug · v: video · r: respawn</div>
+
+<script type="module">
+
+// ====================== FLUID CONFIG ======================
+// Double-density relaxation (Clavet et al. 2005) contained fluid.
+// Body silhouette = container. Particles = water inside the body.
+// Gravity pulls down, pressure keeps incompressible, boundary
+// keeps contained, body acceleration creates inertial sloshing.
+const FLUID = {
+  COUNT: 2000,
+  SMOOTH_R: 20,          // SPH smoothing kernel radius (pixels)
+  GRAVITY: 0.12,          // constant downward pull
+  STIFFNESS: 4,           // pressure from density error
+  NEAR_STIFFNESS: 8,      // near-pressure prevents particle overlap
+  DAMPING: 0.985,         // velocity damping per frame
+  INERTIA_SCALE: 1.5,     // body acceleration → opposite pseudo-force
+  CONTAIN_FORCE: 4.0,     // boundary push strength (pixels)
+  EDGE_ZONE: 0.25,        // depth fraction for soft inner boundary
+  MAX_SPEED: 12,
+  SETTLE_THRESH: 0.05,    // below this speed, kill velocity
+  FIELD_W: 160,
+  FIELD_H: 120,
+  BODY_THRESH: 0.45,
+  TRAIL_ALPHA: 0.06,
+};
+
+// Smoothing radius constants
+const smoothR = FLUID.SMOOTH_R;
+const smoothR2 = smoothR * smoothR;
+
+// ====================== RENDER CONSTANTS ======================
+const INK = [25, 20, 40];
+const BG = 'rgba(245, 240, 232,';
+const DOT_R = 1.8;
+const MARK_MIN = 1.5;
+const MARK_SCALE = 2.5;
+const MARK_W = 2.0;
+const DOT_THRESH = 1.0;
+
+// ====================== CANVAS ======================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('video');
+var W, H;
+
+// ====================== PARTICLE STATE ======================
+const MAX = 5000;
+const px = new Float32Array(MAX);
+const py = new Float32Array(MAX);
+const pvx = new Float32Array(MAX);
+const pvy = new Float32Array(MAX);
+const ppx = new Float32Array(MAX);          // previous x (for PBD velocity derivation)
+const ppy = new Float32Array(MAX);          // previous y
+const pdensity = new Float32Array(MAX);     // double-density: regular
+const pnearDensity = new Float32Array(MAX); // double-density: near
+const pspeed = new Float32Array(MAX);
+var count = 0;
+var restDensity = 0;
+
+function spawn(x, y, vx, vy) {
+  if (count >= MAX) return;
+  px[count] = x; py[count] = y;
+  pvx[count] = vx; pvy[count] = vy;
+  ppx[count] = x; ppy[count] = y;
+  count++;
+}
+
+// ====================== SPATIAL HASH ======================
+var cellSize = smoothR;
+var gridW = 1, gridH = 1;
+var gridHead = new Int32Array(1);
+var gridNext = new Int32Array(MAX);
+
+function rebuildGrid() {
+  if (!W) return;
+  gridW = Math.ceil(W / cellSize) + 1;
+  gridH = Math.ceil(H / cellSize) + 1;
+  gridHead = new Int32Array(gridW * gridH);
+}
+
+function hashReset() { gridHead.fill(-1); }
+
+function hashInsert(i) {
+  const cx = Math.max(0, Math.min(gridW - 1, (px[i] / cellSize) | 0));
+  const cy = Math.max(0, Math.min(gridH - 1, (py[i] / cellSize) | 0));
+  const key = cy * gridW + cx;
+  gridNext[i] = gridHead[key];
+  gridHead[key] = i;
+}
+
+// ====================== RESIZE ======================
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+  ctx.fillStyle = BG + '1)';
+  ctx.fillRect(0, 0, W, H);
+  rebuildGrid();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ====================== MASK FIELD ======================
+
+const fieldMask = new Float32Array(FLUID.FIELD_W * FLUID.FIELD_H);
+const fieldGX = new Float32Array(FLUID.FIELD_W * FLUID.FIELD_H);
+const fieldGY = new Float32Array(FLUID.FIELD_W * FLUID.FIELD_H);
+var hasMask = false;
+var bodyDetected = false;
+
+// Body centroid tracking for inertia
+var bodyCX = 0, bodyCY = 0;
+var bodyVelX = 0, bodyVelY = 0;
+var bodyAccX = 0, bodyAccY = 0;
+var prevBodyVX = 0, prevBodyVY = 0;
+var centroidInit = false;
+
+var videoFileMode = false;
+
+function updateMask(maskData, mw, mh) {
+  const FW = FLUID.FIELD_W, FH = FLUID.FIELD_H;
+  const scaleX = mw / FW, scaleY = mh / FH;
+
+  // Sample mask into field (mirror for webcam, direct for video file)
+  for (let fy = 0; fy < FH; fy++) {
+    for (let fx = 0; fx < FW; fx++) {
+      const mx = videoFileMode ? Math.floor(fx * scaleX) : mw - 1 - Math.floor(fx * scaleX);
+      const my = Math.floor(fy * scaleY);
+      fieldMask[fy * FW + fx] = maskData[my * mw + mx];
+    }
+  }
+
+  // Gradient field — central differences, points toward body interior
+  for (let y = 1; y < FH - 1; y++) {
+    for (let x = 1; x < FW - 1; x++) {
+      const i = y * FW + x;
+      fieldGX[i] = (fieldMask[i + 1] - fieldMask[i - 1]) * 0.5;
+      fieldGY[i] = (fieldMask[i + FW] - fieldMask[i - FW]) * 0.5;
+    }
+  }
+
+  // Body centroid, velocity, acceleration
+  let sx = 0, sy = 0, sw = 0;
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      const w = fieldMask[y * FW + x];
+      if (w > FLUID.BODY_THRESH) { sx += x * w; sy += y * w; sw += w; }
+    }
+  }
+
+  if (sw > 10) {
+    const prevCX = bodyCX, prevCY = bodyCY;
+    bodyCX = (sx / sw) / FW * W;
+    bodyCY = (sy / sw) / FH * H;
+
+    if (centroidInit) {
+      prevBodyVX = bodyVelX;
+      prevBodyVY = bodyVelY;
+      const rawVX = bodyCX - prevCX, rawVY = bodyCY - prevCY;
+      bodyVelX = bodyVelX * 0.3 + rawVX * 0.7;
+      bodyVelY = bodyVelY * 0.3 + rawVY * 0.7;
+      const maxV = 30;
+      bodyVelX = Math.max(-maxV, Math.min(maxV, bodyVelX));
+      bodyVelY = Math.max(-maxV, Math.min(maxV, bodyVelY));
+      bodyAccX = bodyAccX * 0.4 + (bodyVelX - prevBodyVX) * 0.6;
+      bodyAccY = bodyAccY * 0.4 + (bodyVelY - prevBodyVY) * 0.6;
+    } else {
+      centroidInit = true;
+    }
+
+    if (!bodyDetected) {
+      bodyDetected = true;
+      activateFluid();
+    }
+  }
+
+  hasMask = true;
+}
+
+function sampleField(arr, fx, fy) {
+  const FW = FLUID.FIELD_W;
+  const ix = Math.floor(fx), iy = Math.floor(fy);
+  if (ix < 0 || ix >= FW - 1 || iy < 0 || iy >= FLUID.FIELD_H - 1) return 0;
+  const dx = fx - ix, dy = fy - iy;
+  const i = iy * FW + ix;
+  return arr[i] * (1 - dx) * (1 - dy)
+       + arr[i + 1] * dx * (1 - dy)
+       + arr[i + FW] * (1 - dx) * dy
+       + arr[i + FW + 1] * dx * dy;
+}
+
+// ====================== FLUID: SPAWN ======================
+
+function spawnFluid() {
+  count = 0;
+  restDensity = 0; // reset — auto-calibrated on first sim frame
+  const FW = FLUID.FIELD_W, FH = FLUID.FIELD_H;
+  const cells = [];
+  for (let y = 0; y < FH; y++) {
+    for (let x = 0; x < FW; x++) {
+      if (fieldMask[y * FW + x] > FLUID.BODY_THRESH) cells.push(y * FW + x);
+    }
+  }
+  if (cells.length === 0) return;
+
+  for (let i = 0; i < FLUID.COUNT; i++) {
+    const idx = cells[Math.floor(Math.random() * cells.length)];
+    const cx = idx % FW, cy = (idx / FW) | 0;
+    spawn(
+      (cx + Math.random()) / FW * W,
+      (cy + Math.random()) / FH * H,
+      0, 0  // start at rest — gravity and pressure will settle them
+    );
+  }
+
+  ctx.fillStyle = BG + '1)';
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ====================== FLUID: SIMULATE ======================
+// Double-density relaxation with position-based corrections.
+// 7-phase pipeline per frame:
+//   1. External forces → velocity
+//   2. Save positions + predict
+//   3. Build spatial hash
+//   4. Compute double-density (density + near-density)
+//   5. Pressure relaxation (position corrections)
+//   6. Boundary enforcement (mask containment)
+//   7. Derive velocity from position delta + damping + limits
+
+function simFluid(dt) {
+  if (!hasMask || count === 0) return;
+
+  const FW = FLUID.FIELD_W, FH = FLUID.FIELD_H;
+
+  // --- Phase 1: External forces → velocity ---
+  for (let i = 0; i < count; i++) {
+    // Gravity — constant downward pull
+    pvy[i] += FLUID.GRAVITY * dt;
+
+    // Inertia — body ACCELERATION creates opposite force on particles.
+    // Body accelerates right → particles slosh left (like water in a glass).
+    // Body decelerates → particles rush forward (momentum).
+    if (centroidInit) {
+      pvx[i] -= bodyAccX * FLUID.INERTIA_SCALE * dt;
+      pvy[i] -= bodyAccY * FLUID.INERTIA_SCALE * dt;
+    }
+  }
+
+  // --- Phase 2: Save positions + predict ---
+  for (let i = 0; i < count; i++) {
+    ppx[i] = px[i];
+    ppy[i] = py[i];
+    px[i] += pvx[i] * dt;
+    py[i] += pvy[i] * dt;
+  }
+
+  // --- Phase 3: Spatial hash on predicted positions ---
+  hashReset();
+  for (let i = 0; i < count; i++) hashInsert(i);
+
+  // --- Phase 4: Double-density estimation ---
+  // density = Σ (1-q)²  — standard SPH-like density
+  // nearDensity = Σ (1-q)³ — extra repulsion at close range
+  for (let i = 0; i < count; i++) {
+    let d = 0, nd = 0;
+    const ci = (px[i] / cellSize) | 0;
+    const cj = (py[i] / cellSize) | 0;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      const gy2 = cj + dy;
+      if (gy2 < 0 || gy2 >= gridH) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const gx2 = ci + dx;
+        if (gx2 < 0 || gx2 >= gridW) continue;
+        let j = gridHead[gy2 * gridW + gx2];
+        while (j >= 0) {
+          if (j !== i) {
+            const rx = px[j] - px[i], ry = py[j] - py[i];
+            const r2 = rx * rx + ry * ry;
+            if (r2 < smoothR2) {
+              const q = Math.sqrt(r2) / smoothR;
+              const w = 1 - q;
+              d += w * w;
+              nd += w * w * w;
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+    pdensity[i] = d;
+    pnearDensity[i] = nd;
+  }
+
+  // Auto-calibrate rest density on first simulation frame.
+  // Slightly below average → mild expansion keeps particles
+  // from collapsing into a tight clump.
+  if (restDensity === 0 && count > 0) {
+    let total = 0;
+    for (let i = 0; i < count; i++) total += pdensity[i];
+    restDensity = (total / count) * 0.8;
+  }
+
+  // --- Phase 5: Pressure relaxation (position corrections) ---
+  // Each particle applies position corrections to itself and
+  // its neighbors based on pressure from density error.
+  // Positive pressure (compressed) → push apart.
+  // Negative pressure (sparse) → gentle attraction (surface tension).
+  for (let i = 0; i < count; i++) {
+    const P = FLUID.STIFFNESS * (pdensity[i] - restDensity);
+    const Pnear = FLUID.NEAR_STIFFNESS * pnearDensity[i];
+    let dix = 0, diy = 0;
+
+    const ci = (px[i] / cellSize) | 0;
+    const cj = (py[i] / cellSize) | 0;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      const gy2 = cj + dy;
+      if (gy2 < 0 || gy2 >= gridH) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const gx2 = ci + dx;
+        if (gx2 < 0 || gx2 >= gridW) continue;
+        let j = gridHead[gy2 * gridW + gx2];
+        while (j >= 0) {
+          if (j !== i) {
+            const rx = px[j] - px[i], ry = py[j] - py[i];
+            const r2 = rx * rx + ry * ry;
+            if (r2 < smoothR2 && r2 > 0.01) {
+              const r = Math.sqrt(r2);
+              const q = r / smoothR;
+              const w = 1 - q;
+
+              // Displacement: push j away from i (positive P → expansion)
+              const D = dt * (P * w + Pnear * w * w);
+              const Dx = D * rx / r;
+              const Dy = D * ry / r;
+
+              px[j] += Dx * 0.5;
+              py[j] += Dy * 0.5;
+              dix -= Dx * 0.5;
+              diy -= Dy * 0.5;
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+
+    px[i] += dix;
+    py[i] += diy;
+  }
+
+  // --- Phase 6: Boundary enforcement ---
+  // Mask-based containment: particles outside the body silhouette
+  // get pushed back toward the interior. Soft boundary zone inside
+  // the edge prevents particles from leaking through thin regions.
+  for (let i = 0; i < count; i++) {
+    const fx = px[i] / W * FW;
+    const fy = py[i] / H * FH;
+    const mask = sampleField(fieldMask, fx, fy);
+    const gx = sampleField(fieldGX, fx, fy);
+    const gy = sampleField(fieldGY, fx, fy);
+    const gMag = Math.sqrt(gx * gx + gy * gy) + 0.0001;
+    const gnx = gx / gMag, gny = gy / gMag;
+
+    if (mask < FLUID.BODY_THRESH) {
+      // OUTSIDE body — strong push toward interior
+      const pushStr = FLUID.CONTAIN_FORCE * (1 - mask / FLUID.BODY_THRESH);
+      px[i] += gnx * pushStr;
+      py[i] += gny * pushStr;
+      // Centroid fallback for particles far from body
+      const cdx = bodyCX - px[i], cdy = bodyCY - py[i];
+      const cd = Math.sqrt(cdx * cdx + cdy * cdy) + 0.001;
+      px[i] += (cdx / cd) * 1.0;
+      py[i] += (cdy / cd) * 1.0;
+    } else {
+      // INSIDE body — soft boundary repulsion near edges
+      const depth = (mask - FLUID.BODY_THRESH) / (1 - FLUID.BODY_THRESH);
+      if (depth < FLUID.EDGE_ZONE) {
+        const strength = FLUID.CONTAIN_FORCE * (1 - depth / FLUID.EDGE_ZONE) * 0.5;
+        px[i] += gnx * strength;
+        py[i] += gny * strength;
+      }
+    }
+
+    // Screen bounds
+    if (px[i] < 1) px[i] = 1;
+    if (px[i] >= W - 1) px[i] = W - 2;
+    if (py[i] < 1) py[i] = 1;
+    if (py[i] >= H - 1) py[i] = H - 2;
+  }
+
+  // --- Phase 7: Derive velocity from position delta ---
+  // In PBD, velocity = (new_pos - old_pos) / dt. This captures
+  // all forces (gravity, pressure, boundary) as implicit velocity.
+  const invDt = dt > 0.001 ? 1 / dt : 0;
+  for (let i = 0; i < count; i++) {
+    pvx[i] = (px[i] - ppx[i]) * invDt;
+    pvy[i] = (py[i] - ppy[i]) * invDt;
+
+    // Viscous damping — bleeds energy every frame
+    pvx[i] *= FLUID.DAMPING;
+    pvy[i] *= FLUID.DAMPING;
+
+    // Speed limit
+    const spd = Math.sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i]);
+    if (spd > FLUID.MAX_SPEED) {
+      pvx[i] *= FLUID.MAX_SPEED / spd;
+      pvy[i] *= FLUID.MAX_SPEED / spd;
+    }
+
+    // Settle — kill tiny velocities so particles truly come to rest
+    if (spd < FLUID.SETTLE_THRESH) {
+      pvx[i] = 0;
+      pvy[i] = 0;
+    }
+  }
+}
+
+// ====================== ACTIVATION ======================
+
+var fluidActive = false;
+
+function activateFluid() {
+  fluidActive = true;
+  cellSize = smoothR;
+  rebuildGrid();
+  spawnFluid();
+  document.getElementById('overlay').style.display = 'none';
+}
+
+// ====================== RENDERING ======================
+
+function render() {
+  // Trail fade
+  ctx.fillStyle = BG + FLUID.TRAIL_ALPHA + ')';
+  ctx.fillRect(0, 0, W, H);
+
+  // Video overlay (toggleable with 'v')
+  if (showVideo && cameraActive) {
+    ctx.save();
+    if (videoFileMode) {
+      ctx.globalAlpha = 0.3;
+      ctx.drawImage(video, 0, 0, W, H);
+    } else {
+      ctx.globalAlpha = 0.1;
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, -W, 0, W, H);
+    }
+    ctx.restore();
+  }
+
+  if (count === 0) return;
+
+  // Compute speeds for rendering
+  for (let i = 0; i < count; i++) {
+    pspeed[i] = Math.sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i]);
+  }
+
+  const [ir, ig, ib] = INK;
+
+  // Slow/settled particles → dots
+  ctx.fillStyle = `rgba(${ir},${ig},${ib},0.4)`;
+  ctx.beginPath();
+  for (let i = 0; i < count; i++) {
+    if (pspeed[i] < DOT_THRESH) {
+      ctx.moveTo(px[i] + DOT_R, py[i]);
+      ctx.arc(px[i], py[i], DOT_R, 0, Math.PI * 2);
+    }
+  }
+  ctx.fill();
+
+  // Moving particles → directional marks, binned by speed
+  ctx.lineCap = 'round';
+  const BINS = 6;
+  const binSize = (FLUID.MAX_SPEED - DOT_THRESH) / BINS;
+
+  for (let b = 0; b < BINS; b++) {
+    const t = (b + 1) / BINS;
+    const alpha = 0.25 + t * 0.5;
+    const width = MARK_W * (1 - t * 0.4);
+
+    ctx.strokeStyle = `rgba(${ir},${ig},${ib},${alpha.toFixed(2)})`;
+    ctx.lineWidth = Math.max(width, 0.5);
+    ctx.beginPath();
+    let any = false;
+
+    for (let i = 0; i < count; i++) {
+      if (pspeed[i] < DOT_THRESH) continue;
+      const bin = Math.min(Math.floor((pspeed[i] - DOT_THRESH) / binSize), BINS - 1);
+      if (bin !== b) continue;
+
+      const len = MARK_MIN + pspeed[i] * MARK_SCALE;
+      const nx = pvx[i] / pspeed[i], ny = pvy[i] / pspeed[i];
+      ctx.moveTo(px[i] - nx * len * 0.5, py[i] - ny * len * 0.5);
+      ctx.lineTo(px[i] + nx * len * 0.5, py[i] + ny * len * 0.5);
+      any = true;
+    }
+
+    if (any) ctx.stroke();
+  }
+}
+
+// ====================== MEDIAPIPE ======================
+var poseLandmarker = null;
+var cameraActive = false;
+var mediaPipeReady = false;
+var lastDetectTime = 0;
+const DETECT_INTERVAL = 50;
+
+async function initMediaPipe() {
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = 'loading mediapipe...';
+
+  try {
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm');
+    const { PoseLandmarker, FilesetResolver } = vision;
+
+    statusEl.textContent = 'loading wasm runtime...';
+    const fr = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+
+    statusEl.textContent = 'loading pose model...';
+    poseLandmarker = await PoseLandmarker.createFromOptions(fr, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task',
+      },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      outputSegmentationMasks: true,
+    });
+
+    mediaPipeReady = true;
+    statusEl.textContent = 'detecting body...';
+    return true;
+  } catch (e) {
+    console.error('MediaPipe init failed:', e);
+    document.getElementById('status').textContent = 'mediapipe failed';
+    setTimeout(() => { document.getElementById('overlay').style.display = 'none'; }, 3000);
+    return false;
+  }
+}
+
+var detectCount = 0, detectErrors = 0, maskCount = 0;
+
+function detectPose(timestamp) {
+  if (!poseLandmarker || !cameraActive) return;
+  if (timestamp - lastDetectTime < DETECT_INTERVAL) return;
+  if (video.readyState < 2) return;
+
+  lastDetectTime = timestamp;
+  detectCount++;
+
+  try {
+    const result = poseLandmarker.detectForVideo(video, performance.now());
+
+    if (result.segmentationMasks && result.segmentationMasks.length > 0) {
+      try {
+        const mask = result.segmentationMasks[0];
+        const data = mask.getAsFloat32Array();
+        updateMask(data, mask.width, mask.height);
+        maskCount++;
+      } catch (e) {
+        if (detectErrors <= 3) console.warn('[bodypipe] mask error:', e);
+      }
+    }
+  } catch (e) {
+    detectErrors++;
+    if (detectErrors <= 5) console.error('[bodypipe] detect error:', e);
+  }
+}
+
+// ====================== CAMERA ======================
+async function startCamera() {
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('fileLabel').style.display = 'none';
+
+  const mpPromise = initMediaPipe();
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    video.muted = true;
+    await video.play();
+    cameraActive = true;
+  } catch (e) {
+    console.error('Camera failed:', e);
+    document.getElementById('status').textContent = 'camera unavailable';
+    setTimeout(() => { document.getElementById('overlay').style.display = 'none'; }, 2000);
+    return;
+  }
+
+  await mpPromise;
+}
+
+// ====================== VIDEO FILE ======================
+async function startVideoFile(file) {
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('fileLabel').style.display = 'none';
+
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = 'loading video: ' + file.name;
+  console.log('[bodypipe] startVideoFile:', file.name, file.type, file.size);
+
+  const mpPromise = initMediaPipe();
+
+  const url = URL.createObjectURL(file);
+  video.srcObject = null;
+  video.src = url;
+  video.loop = true;
+  video.muted = true;
+  video.playsInline = true;
+
+  const loaded = await new Promise(resolve => {
+    let done = false;
+    const ok = evt => { if (!done) { done = true; console.log('[bodypipe] video ready:', evt); resolve(true); } };
+    const fail = () => { if (!done) { done = true; console.error('[bodypipe] video error:', video.error); resolve(false); } };
+    video.addEventListener('canplay', () => ok('canplay'), { once: true });
+    video.addEventListener('loadeddata', () => ok('loadeddata'), { once: true });
+    video.addEventListener('loadedmetadata', () => ok('loadedmetadata'), { once: true });
+    video.addEventListener('error', fail, { once: true });
+    setTimeout(() => { if (!done) { done = true; resolve(false); } }, 8000);
+    video.load();
+  });
+
+  if (!loaded) {
+    statusEl.textContent = 'video failed — try MP4/H.264';
+    document.getElementById('startBtn').style.display = '';
+    document.getElementById('fileLabel').style.display = '';
+    return;
+  }
+
+  statusEl.textContent = 'starting playback...';
+  try {
+    await video.play();
+    cameraActive = true;
+    videoFileMode = true;
+    showVideo = true;
+    console.log('[bodypipe] video playing:', video.videoWidth, 'x', video.videoHeight);
+  } catch (e) {
+    console.error('[bodypipe] playback failed:', e);
+    statusEl.textContent = 'playback failed: ' + e.message;
+    document.getElementById('startBtn').style.display = '';
+    document.getElementById('fileLabel').style.display = '';
+    return;
+  }
+
+  await mpPromise;
+}
+
+// ====================== EVENT LISTENERS ======================
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  if (!cameraActive) startCamera();
+});
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) startVideoFile(e.target.files[0]);
+});
+
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('video/')) startVideoFile(f);
+});
+
+canvas.addEventListener('click', () => {
+  if (!cameraActive) startCamera();
+});
+
+var showDebug = false;
+var showVideo = false;
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'd') {
+    showDebug = !showDebug;
+    document.getElementById('debug').style.display = showDebug ? 'block' : 'none';
+  }
+  if (e.key === 'v') showVideo = !showVideo;
+  if (e.key === 'r') {
+    if (fluidActive && hasMask && bodyDetected) spawnFluid();
+  }
+});
+
+// ====================== MAIN LOOP ======================
+var lastFrameTime = 0;
+var fpsStart = 0, fpsFrames = 0, fps = 60;
+
+function frame(t) {
+  const dt = lastFrameTime ? Math.min((t - lastFrameTime) / 16.67, 2.5) : 1;
+  lastFrameTime = t;
+
+  fpsFrames++;
+  if (fpsFrames >= 30) {
+    if (fpsStart > 0) fps = Math.round(30000 / (t - fpsStart));
+    fpsStart = t; fpsFrames = 0;
+  }
+
+  detectPose(t);
+
+  if (fluidActive) {
+    simFluid(dt);
+  }
+
+  render();
+
+  if (showDebug) {
+    const dbg = document.getElementById('debug');
+    dbg.style.display = 'block';
+    let txt = `${fps} fps | ${count} particles | fluid`;
+    txt += ` | vel: ${bodyVelX.toFixed(1)},${bodyVelY.toFixed(1)}`;
+    txt += ` | acc: ${bodyAccX.toFixed(2)},${bodyAccY.toFixed(2)}`;
+    txt += ` | masks: ${maskCount}`;
+    txt += ` | rho0: ${restDensity.toFixed(1)}`;
+    dbg.textContent = txt;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ====================== INIT ======================
+rebuildGrid();
+
+ctx.fillStyle = BG + '1)';
+ctx.fillRect(0, 0, W, H);
+
+setTimeout(() => {
+  const hint = document.getElementById('hint');
+  hint.style.transition = 'opacity 2s';
+  hint.style.opacity = '0';
+}, 5000);
+
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>

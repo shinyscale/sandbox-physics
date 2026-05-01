@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Sand Engine — API Demo</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 920px; justify-content: center; }
+.btn { padding: 5px 10px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 12px; transition: background 0.1s; }
+.btn.active { border-color: #fff; background: #3a3a5e; }
+.btn:hover { background: #3a3a5e; }
+h1 { font-size: 14px; margin-bottom: 6px; color: #888; }
+.status { margin-top: 6px; font-size: 11px; color: #666; }
+.info { margin-top: 4px; font-size: 10px; color: #555; max-width: 920px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Sand Engine — Standalone API Demo</h1>
+<div class="toolbar" id="toolbar"></div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span> · <span id="particles">0 particles</span> · <span id="chunks">0 chunks</span>
+</div>
+<div class="info">
+  This demo imports sand-engine.js as an ES module. The engine has no DOM dependencies.<br>
+  Click to draw · Scroll to resize brush · Space to pause · G for city · E for explode mode · C to clear
+</div>
+
+<script type="module">
+import { SandEngine, Materials } from './sand-engine.js';
+
+const W = 300, H = 200, SCALE = 3;
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// Create the engine — this is the entire physics setup
+const engine = new SandEngine(W, H);
+
+// Offscreen buffer for blitting
+const imgData = ctx.createImageData(W, H);
+const offscreen = new OffscreenCanvas(W, H);
+const octx = offscreen.getContext('2d');
+
+// UI state (game-specific, not part of engine)
+let material = Materials.SAND;
+let brushSize = 3;
+let mouseDown = false;
+let mouseX = 0, mouseY = 0;
+let paused = false;
+let explodeMode = false;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+
+// Material palette for toolbar
+const palette = [
+  [Materials.SAND, 'Sand'], [Materials.WATER, 'Water'], [Materials.STONE, 'Stone'],
+  [Materials.ICE, 'Ice'], [Materials.WOOD, 'Wood'], [Materials.METAL, 'Metal'],
+  [Materials.CONCRETE, 'Concrete'], [Materials.BRICK, 'Brick'], [Materials.GLASS, 'Glass'],
+  [Materials.OIL, 'Oil'], [Materials.GUNPOWDER, 'Powder'], [Materials.ACID, 'Acid'],
+  [Materials.LAVA, 'Lava'], [Materials.NAPALM, 'Napalm'],
+  [Materials.FIRE, 'Fire'], [Materials.GAS, 'Gas'], [Materials.PLANT, 'Plant'],
+  [Materials.CLONE, 'Clone'], [Materials.VOID, 'Void'],
+  [Materials.EMPTY, 'Erase'],
+];
+
+// Build toolbar
+const toolbar = document.getElementById('toolbar');
+palette.forEach(([id, name]) => {
+  const btn = document.createElement('button');
+  btn.className = 'btn' + (id === material ? ' active' : '');
+  btn.textContent = name;
+  btn.dataset.mat = id;
+  btn.addEventListener('click', () => {
+    material = id;
+    explodeMode = false;
+    toolbar.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+  toolbar.appendChild(btn);
+});
+
+// Explode button
+const expBtn = document.createElement('button');
+expBtn.className = 'btn';
+expBtn.textContent = 'Explode (E)';
+expBtn.style.borderColor = '#f44';
+expBtn.addEventListener('click', () => {
+  explodeMode = !explodeMode;
+  expBtn.classList.toggle('active', explodeMode);
+});
+toolbar.appendChild(expBtn);
+
+// City button
+const cityBtn = document.createElement('button');
+cityBtn.className = 'btn';
+cityBtn.textContent = 'City (G)';
+cityBtn.style.borderColor = '#48c';
+cityBtn.addEventListener('click', () => engine.generateCity());
+toolbar.appendChild(cityBtn);
+
+// Clear button
+const clearBtn = document.createElement('button');
+clearBtn.className = 'btn';
+clearBtn.textContent = 'Clear (C)';
+clearBtn.style.borderColor = '#833';
+clearBtn.addEventListener('click', () => engine.clear());
+toolbar.appendChild(clearBtn);
+
+// Input
+canvas.addEventListener('mousedown', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+  if (explodeMode) {
+    engine.explode(mouseX, mouseY, 10);
+  } else {
+    mouseDown = true;
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mouseup', () => mouseDown = false);
+canvas.addEventListener('mouseleave', () => mouseDown = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(20, brushSize + (e.deltaY > 0 ? -1 : 1)));
+}, { passive: false });
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === ' ') { e.preventDefault(); paused = !paused; }
+  if (k === 'c' && !e.ctrlKey) engine.clear();
+  if (k === 'g') engine.generateCity();
+  if (k === 'e') {
+    explodeMode = !explodeMode;
+    expBtn.classList.toggle('active', explodeMode);
+  }
+});
+
+// Game loop — uses only the engine's public API
+function loop() {
+  // Paint with brush
+  if (mouseDown && !explodeMode) {
+    engine.paintCircle(mouseX, mouseY, brushSize, material);
+  }
+
+  // Step simulation
+  if (!paused) engine.step();
+
+  // Render — engine returns a Uint32Array we blit to canvas
+  const pixels = engine.render({ time: performance.now() });
+  new Uint32Array(imgData.data.buffer).set(pixels);
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+
+  // FPS counter
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    document.getElementById('fps').textContent = `${frameCount} fps`;
+    document.getElementById('particles').textContent = `${engine.particleCount()} particles`;
+    document.getElementById('chunks').textContent = `${engine.chunks.length} chunks`;
+    frameCount = 0;
+    lastFpsTime = now;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>

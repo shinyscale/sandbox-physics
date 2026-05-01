@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Sound Sandbox — hear the physics</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; user-select: none; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 4px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 920px; justify-content: center; }
+.btn { padding: 4px 8px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; transition: all 0.15s; display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.btn.active { border-color: #fff; background: #3a3a5e; box-shadow: 0 0 6px rgba(255,255,255,0.15); }
+.btn:hover { background: #3a3a5e; }
+.btn .swatch { width: 14px; height: 8px; border-radius: 2px; margin-bottom: 1px; }
+.btn .key { font-size: 9px; color: #888; }
+.sep { width: 1px; height: 32px; background: #444; margin: 0 4px; }
+h1 { font-size: 14px; margin-bottom: 2px; color: #888; }
+.subtitle { font-size: 10px; color: #555; margin-bottom: 8px; font-style: italic; }
+.status { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #666; align-items: center; }
+.info { margin-top: 6px; font-size: 10px; color: #555; max-width: 920px; text-align: center; line-height: 1.5; }
+.vol { display: flex; align-items: center; gap: 4px; }
+.vol input[type=range] { width: 60px; accent-color: #6a8; }
+#audio-badge { padding: 3px 8px; border-radius: 3px; font-size: 10px; cursor: pointer; transition: all 0.2s; }
+#audio-badge.off { background: #442; color: #a86; }
+#audio-badge.on { background: #243; color: #6a8; }
+/* FX Panel */
+.fx-panel { max-width: 920px; width: 100%; margin-top: 8px; }
+.fx-header { padding: 6px 10px; background: #222238; border: 1px solid #444; border-radius: 3px; cursor: pointer; font-size: 11px; color: #888; transition: all 0.2s; }
+.fx-header:hover { background: #2a2a42; color: #aaa; }
+.fx-header.open { border-radius: 3px 3px 0 0; border-bottom-color: #333; }
+.fx-body { background: #1e1e32; border: 1px solid #444; border-top: none; border-radius: 0 0 3px 3px; padding: 8px; display: flex; gap: 12px; flex-wrap: wrap; }
+.fx-section { flex: 1; min-width: 200px; padding: 8px; background: #222238; border-radius: 3px; }
+.fx-title { font-size: 11px; color: #8a8; margin-bottom: 6px; font-weight: bold; }
+.fx-hint { font-size: 9px; color: #555; margin-bottom: 6px; }
+.fx-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 10px; }
+.fx-row label { min-width: 35px; color: #888; text-align: right; }
+.fx-row select { background: #2a2a3e; color: #ccc; border: 1px solid #555; border-radius: 2px; padding: 2px 4px; font-family: monospace; font-size: 10px; }
+.fx-row input[type=range] { width: 100px; accent-color: #6a8; }
+.fx-row .val { color: #6a8; font-size: 9px; min-width: 55px; }
+.sample-slot { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; padding: 3px 4px; border-radius: 2px; background: #1e1e32; }
+.sample-slot .mat-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.sample-slot .mat-name { font-size: 10px; color: #aaa; min-width: 40px; }
+.sample-slot .sample-name { font-size: 9px; color: #6a8; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.sample-slot .sample-name.empty { color: #555; font-style: italic; }
+.sample-btn { padding: 1px 6px; font-size: 9px; background: #2a2a3e; border: 1px solid #555; color: #aaa; cursor: pointer; border-radius: 2px; font-family: monospace; flex-shrink: 0; }
+.sample-btn:hover { background: #3a3a5e; color: #fff; }
+.sample-btn.clear { color: #a66; border-color: #644; }
+.sample-btn.clear:hover { background: #3a2a2e; }
+.sample-btn.preview { color: #6a8; border-color: #465; }
+.drop-zone { border: 1px dashed #555; border-radius: 3px; padding: 10px; text-align: center; font-size: 9px; color: #555; margin-top: 6px; cursor: pointer; transition: all 0.2s; }
+.drop-zone:hover, .drop-zone.dragover { border-color: #6a8; color: #6a8; background: rgba(102,170,136,0.05); }
+</style>
+</head>
+<body>
+<h1>sound sandbox</h1>
+<div class="subtitle">every grain of sand is a silent note — until it isn't</div>
+<div class="toolbar" id="toolbar"></div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span>
+  <span id="particles">0 particles</span>
+  <span id="collisions-display">0 sounds</span>
+  <span id="audio-badge" class="off">click to enable audio</span>
+  <div class="vol"><label>vol</label><input type="range" id="vol" min="0" max="100" value="60"></div>
+</div>
+<div class="info">
+  Draw: click+drag · Erase: right-click · Brush: scroll · 0-6: materials · Space: pause · C: clear · M: mute · F: effects<br>
+  <b>Drop sand onto metal for a xylophone. Pour water on glass for chimes. Load your own .wav samples to build custom instruments.</b>
+</div>
+
+<div class="fx-panel" id="fx-panel">
+  <div class="fx-header" id="fx-header">&#9654; Samples &amp; Effects</div>
+  <div class="fx-body" id="fx-body" style="display:none">
+    <div class="fx-section" style="flex: 1.5">
+      <div class="fx-title">Sample Bank</div>
+      <div class="fx-hint">Load audio files to replace synth sounds per surface material</div>
+      <div id="sample-slots"></div>
+      <div class="drop-zone" id="drop-zone">
+        Drop audio files here<br>
+        <span style="font-size:8px;color:#444">Filename matching: sand.wav → Sand, metal.wav → Metal, etc.</span>
+      </div>
+    </div>
+    <div class="fx-section">
+      <div class="fx-title">Reverb</div>
+      <div class="fx-row">
+        <label>IR:</label>
+        <select id="reverb-ir">
+          <option value="none" selected>Off</option>
+          <option value="room">Small Room</option>
+          <option value="hall">Large Hall</option>
+          <option value="plate">Plate</option>
+          <option value="cathedral">Cathedral</option>
+          <option value="custom">Load IR file...</option>
+        </select>
+      </div>
+      <div class="fx-row">
+        <label>Wet:</label>
+        <input type="range" id="reverb-wet" min="0" max="100" value="0">
+        <span class="val" id="reverb-wet-val">0%</span>
+      </div>
+      <div class="fx-row">
+        <label>Dry:</label>
+        <input type="range" id="reverb-dry" min="0" max="100" value="100">
+        <span class="val" id="reverb-dry-val">100%</span>
+      </div>
+      <input type="file" id="ir-file" accept=".wav,.mp3,.ogg,.flac" style="display:none">
+    </div>
+    <div class="fx-section">
+      <div class="fx-title">Filter</div>
+      <div class="fx-row">
+        <label>Type:</label>
+        <select id="filter-type">
+          <option value="allpass" selected>Off</option>
+          <option value="lowpass">Lowpass</option>
+          <option value="highpass">Highpass</option>
+          <option value="bandpass">Bandpass</option>
+          <option value="notch">Notch</option>
+          <option value="peaking">Peaking</option>
+        </select>
+      </div>
+      <div class="fx-row">
+        <label>Freq:</label>
+        <input type="range" id="filter-freq" min="0" max="100" value="50">
+        <span class="val" id="filter-freq-val">1000 Hz</span>
+      </div>
+      <div class="fx-row">
+        <label>Q:</label>
+        <input type="range" id="filter-q" min="0" max="100" value="20">
+        <span class="val" id="filter-q-val">1.0</span>
+      </div>
+      <div class="fx-row">
+        <label>Gain:</label>
+        <input type="range" id="filter-gain" min="-24" max="24" value="0">
+        <span class="val" id="filter-gain-val">0 dB</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== CONSTANTS ====================
+const W = 300, H = 200, SCALE = 3;
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, METAL = 4, GLASS = 5, WOOD = 6;
+const DENSITY = [0, 4, 3, 8, 9, 8, 5];
+
+const MAT_INFO = [
+  { name: 'Erase',  key: '0', rgb: [40, 40, 60] },
+  { name: 'Sand',   key: '1', rgb: [210, 180, 100] },
+  { name: 'Water',  key: '2', rgb: [40, 80, 200] },
+  { name: 'Stone',  key: '3', rgb: [120, 120, 130] },
+  { name: 'Metal',  key: '4', rgb: [170, 175, 182] },
+  { name: 'Glass',  key: '5', rgb: [180, 215, 250] },
+  { name: 'Wood',   key: '6', rgb: [100, 65, 30] },
+];
+
+// Pentatonic scale for metal — C major pentatonic across 4 octaves
+const PENTA_FREQS = [
+  130.81, 146.83, 164.81, 196.00, 220.00,
+  261.63, 293.66, 329.63, 392.00, 440.00,
+  523.25, 587.33, 659.25, 783.99, 880.00,
+  1046.50, 1174.66, 1318.51, 1567.98, 1760.00,
+];
+
+// Glass uses upper portion of pentatonic (brighter)
+const GLASS_FREQS = [
+  523.25, 587.33, 659.25, 783.99, 880.00,
+  1046.50, 1174.66, 1318.51, 1567.98, 1760.00,
+  2093.00, 2349.32, 2637.02, 3135.96, 3520.00,
+];
+
+// ==================== GRID STATE ====================
+const grid = new Uint8Array(W * H);
+const movedPrev = new Uint8Array(W * H);
+const movedCur = new Uint8Array(W * H);
+
+// ==================== CANVAS ====================
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const imgData = new ImageData(W, H);
+const pixels = new Uint32Array(imgData.data.buffer);
+const offscreen = new OffscreenCanvas(W, H);
+const octx = offscreen.getContext('2d');
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ==================== UI STATE ====================
+let material = SAND;
+let brushSize = 3;
+let mouseDown = false;
+let rightDown = false;
+let mouseX = 0, mouseY = 0;
+let paused = false;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let currentFps = 60;
+let soundsThisFrame = 0;
+
+// ==================== HELPERS ====================
+function idx(x, y) { return y * W + x; }
+function inBounds(x, y) { return x >= 0 && x < W && y >= 0 && y < H; }
+function get(x, y) { return inBounds(x, y) ? grid[idx(x, y)] : STONE; }
+function isPowder(m) { return m === SAND; }
+function isLiquid(m) { return m === WATER; }
+function isSolid(m) { return m === STONE || m === METAL || m === GLASS || m === WOOD; }
+function isMobile(m) { return isPowder(m) || isLiquid(m); }
+
+function swap(x1, y1, x2, y2) {
+  const i1 = idx(x1, y1), i2 = idx(x2, y2);
+  const t = grid[i1]; grid[i1] = grid[i2]; grid[i2] = t;
+  movedCur[i1] = 1; movedCur[i2] = 1;
+}
+
+// ==================== COLLISION TRACKING ====================
+const collisions = [];
+let sandFlowCount = 0, waterFlowCount = 0;
+
+function recordLanding(x, y) {
+  const i = idx(x, y);
+  const mat = grid[i];
+  if (mat === EMPTY) return;
+  let surface = STONE;
+  if (y + 1 < H) {
+    const below = grid[idx(x, y + 1)];
+    if (below !== EMPTY) surface = below;
+    else return;
+  }
+  collisions.push({ x, y, impactor: mat, surface });
+}
+
+// ==================== PHYSICS ====================
+function simulate() {
+  movedCur.fill(0);
+  collisions.length = 0;
+  sandFlowCount = 0;
+  waterFlowCount = 0;
+  const dir = frameCount & 1 ? 1 : -1;
+
+  for (let y = H - 1; y >= 0; y--) {
+    const x0 = dir > 0 ? 0 : W - 1;
+    for (let n = 0; n < W; n++) {
+      const x = x0 + n * dir;
+      const ci = idx(x, y);
+      const mat = grid[ci];
+      if (mat === EMPTY || isSolid(mat) || movedCur[ci]) continue;
+
+      if (isPowder(mat)) {
+        if (simulatePowder(x, y, mat)) continue;
+        if (movedPrev[ci]) recordLanding(x, y);
+      } else if (isLiquid(mat)) {
+        if (simulateLiquid(x, y, mat)) continue;
+        if (movedPrev[ci]) recordLanding(x, y);
+      }
+    }
+  }
+  movedPrev.set(movedCur);
+}
+
+function canFallInto(x, y, moverMat) {
+  if (!inBounds(x, y)) return false;
+  const target = get(x, y);
+  if (target === EMPTY) return true;
+  if (isPowder(moverMat) && isLiquid(target) && DENSITY[moverMat] > DENSITY[target]) return true;
+  return false;
+}
+
+function simulatePowder(x, y, mat) {
+  if (canFallInto(x, y + 1, mat)) {
+    swap(x, y, x, y + 1);
+    sandFlowCount++;
+    return true;
+  }
+  const d = Math.random() < 0.5 ? -1 : 1;
+  if (canFallInto(x + d, y + 1, mat)) {
+    swap(x, y, x + d, y + 1);
+    sandFlowCount++;
+    return true;
+  }
+  if (canFallInto(x - d, y + 1, mat)) {
+    swap(x, y, x - d, y + 1);
+    sandFlowCount++;
+    return true;
+  }
+  return false;
+}
+
+function simulateLiquid(x, y, mat) {
+  if (y + 1 < H && get(x, y + 1) === EMPTY) {
+    swap(x, y, x, y + 1);
+    waterFlowCount++;
+    return true;
+  }
+  const d = Math.random() < 0.5 ? -1 : 1;
+  if (y + 1 < H && inBounds(x + d, y + 1) && get(x + d, y + 1) === EMPTY) {
+    swap(x, y, x + d, y + 1);
+    waterFlowCount++;
+    return true;
+  }
+  if (y + 1 < H && inBounds(x - d, y + 1) && get(x - d, y + 1) === EMPTY) {
+    swap(x, y, x - d, y + 1);
+    waterFlowCount++;
+    return true;
+  }
+  const spread = 4;
+  const sd = Math.random() < 0.5 ? -1 : 1;
+  for (let pass = 0; pass < 2; pass++) {
+    const sdir = pass === 0 ? sd : -sd;
+    for (let s = 1; s <= spread; s++) {
+      const nx = x + sdir * s;
+      if (!inBounds(nx, y)) break;
+      if (get(nx, y) === EMPTY) {
+        swap(x, y, nx, y);
+        waterFlowCount++;
+        return true;
+      }
+      if (get(nx, y) !== WATER) break;
+    }
+  }
+  return false;
+}
+
+// ==================== AUDIO ENGINE ====================
+let audioCtx = null;
+let masterGain = null;
+let compressor = null;
+let noiseBuffer = null;
+let audioEnabled = false;
+let muted = false;
+
+// Persistent flow sound nodes
+let sandFlowGain = null;
+let waterFlowGain = null;
+
+// Effects chain nodes
+let biquadFx = null;
+let fxBus = null;
+let dryGain = null;
+let wetGain = null;
+let convolverNode = null;
+
+// Sample bank: material ID → { buffer: AudioBuffer, name: string }
+const materialSamples = new Map();
+
+// Synthetic impulse responses: name → AudioBuffer
+const reverbIRs = {};
+
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // Master chain
+  compressor = audioCtx.createDynamicsCompressor();
+  compressor.threshold.value = -20;
+  compressor.knee.value = 10;
+  compressor.ratio.value = 6;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.08;
+
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = parseInt(document.getElementById('vol').value) / 100;
+
+  // Effects chain: compressor → biquadFx → fxBus → [dry + wet reverb] → masterGain → dest
+  biquadFx = audioCtx.createBiquadFilter();
+  biquadFx.type = 'allpass';
+  biquadFx.frequency.value = 1000;
+  biquadFx.Q.value = 1;
+
+  fxBus = audioCtx.createGain();
+  fxBus.gain.value = 1;
+
+  dryGain = audioCtx.createGain();
+  dryGain.gain.value = 1;
+
+  convolverNode = audioCtx.createConvolver();
+  // Initialize with a minimal identity IR so the node has a buffer
+  const identityIR = audioCtx.createBuffer(2, audioCtx.sampleRate * 0.01, audioCtx.sampleRate);
+  identityIR.getChannelData(0)[0] = 1;
+  identityIR.getChannelData(1)[0] = 1;
+  convolverNode.buffer = identityIR;
+
+  wetGain = audioCtx.createGain();
+  wetGain.gain.value = 0; // reverb off by default
+
+  // Wire the graph
+  compressor.connect(biquadFx);
+  biquadFx.connect(fxBus);
+  fxBus.connect(dryGain);
+  dryGain.connect(masterGain);
+  fxBus.connect(convolverNode);
+  convolverNode.connect(wetGain);
+  wetGain.connect(masterGain);
+  masterGain.connect(audioCtx.destination);
+
+  // White noise buffer (2 seconds)
+  const sr = audioCtx.sampleRate;
+  noiseBuffer = audioCtx.createBuffer(1, sr * 2, sr);
+  const d = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+
+  // Flow sounds — persistent filtered noise
+  setupFlowSound('highpass', 3000, 0.5, g => { sandFlowGain = g; });
+  setupFlowSound('lowpass', 600, 1.0, g => { waterFlowGain = g; });
+
+  // Generate synthetic impulse responses
+  generateAllIRs();
+
+  audioEnabled = true;
+  document.getElementById('audio-badge').className = 'on';
+  document.getElementById('audio-badge').textContent = 'audio on';
+}
+
+function setupFlowSound(filterType, freq, Q, assignGain) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  src.loop = true;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = filterType;
+  flt.frequency.value = freq;
+  flt.Q.value = Q;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0;
+  src.connect(flt);
+  flt.connect(gain);
+  gain.connect(compressor);
+  src.start();
+  assignGain(gain);
+}
+
+// ==================== IMPULSE RESPONSE GENERATION ====================
+
+function generateIR(duration, decay, brightness, diffusion) {
+  const sr = audioCtx.sampleRate;
+  const len = Math.floor(sr * duration);
+  const buf = audioCtx.createBuffer(2, len, sr);
+
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    // Pre-delay: ~5-20ms of silence for early reflections separation
+    const preDelay = Math.floor(sr * 0.008 * (1 + diffusion));
+
+    for (let i = 0; i < len; i++) {
+      if (i < preDelay) { data[i] = 0; continue; }
+
+      const t = (i - preDelay) / sr;
+      // Exponential decay envelope
+      const env = Math.exp(-t * decay);
+
+      // Base: filtered white noise
+      let sample = (Math.random() * 2 - 1) * env;
+
+      // Early reflections: sparse impulses in first 50ms
+      if (t < 0.05 && Math.random() < 0.02 * diffusion) {
+        sample += (Math.random() * 2 - 1) * env * 2;
+      }
+
+      // Brightness control: simple one-pole lowpass accumulator
+      if (i > preDelay + 1) {
+        const lpCoeff = 1 - brightness * 0.7; // 0 = full pass, 0.7 = heavy filtering
+        sample = data[i - 1] * lpCoeff + sample * (1 - lpCoeff);
+      }
+
+      // Stereo decorrelation: slight offset between channels
+      data[i] = sample * (0.8 + 0.2 * Math.random());
+    }
+  }
+  return buf;
+}
+
+function generateAllIRs() {
+  // Small room: short, bright, tight
+  reverbIRs.room = generateIR(0.4, 8, 0.9, 0.3);
+  // Large hall: long, warm, diffuse
+  reverbIRs.hall = generateIR(2.5, 1.5, 0.4, 0.8);
+  // Plate: medium, bright, dense
+  reverbIRs.plate = generateIR(1.2, 3.5, 0.85, 0.6);
+  // Cathedral: very long, dark, hugely diffuse
+  reverbIRs.cathedral = generateIR(4.0, 0.8, 0.25, 1.0);
+}
+
+function setReverbIR(name) {
+  if (!audioCtx) return;
+  if (name === 'none') {
+    wetGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
+    document.getElementById('reverb-wet').value = 0;
+    document.getElementById('reverb-wet-val').textContent = '0%';
+    return;
+  }
+  if (name === 'custom') {
+    document.getElementById('ir-file').click();
+    return;
+  }
+  const ir = reverbIRs[name];
+  if (ir) {
+    convolverNode.buffer = ir;
+    // If wet was 0, bump to a nice default
+    const wetSlider = document.getElementById('reverb-wet');
+    if (parseInt(wetSlider.value) === 0) {
+      wetSlider.value = 25;
+      document.getElementById('reverb-wet-val').textContent = '25%';
+      wetGain.gain.setTargetAtTime(0.25, audioCtx.currentTime, 0.05);
+    }
+  }
+}
+
+// ==================== SAMPLE LOADING ====================
+
+async function loadSampleFromFile(file, targetMat) {
+  try {
+    const arrayBuf = await file.arrayBuffer();
+    const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+    materialSamples.set(targetMat, { buffer: audioBuf, name: file.name });
+    updateSampleSlotUI(targetMat);
+  } catch (e) {
+    console.error('Failed to decode audio file:', file.name, e);
+  }
+}
+
+function clearSample(matId) {
+  materialSamples.delete(matId);
+  updateSampleSlotUI(matId);
+}
+
+function previewSample(matId) {
+  if (!audioCtx || !materialSamples.has(matId)) return;
+  const { buffer } = materialSamples.get(matId);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.playbackRate.value = 1;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + Math.min(buffer.duration, 1.0));
+  src.connect(g);
+  g.connect(compressor);
+  src.start();
+  src.stop(audioCtx.currentTime + Math.min(buffer.duration, 1.0));
+  src.onended = () => { src.disconnect(); g.disconnect(); };
+}
+
+function matchFilenameToMaterial(filename) {
+  const lower = filename.toLowerCase().replace(/\.[^.]+$/, ''); // strip extension
+  const matNames = ['erase', 'sand', 'water', 'stone', 'metal', 'glass', 'wood'];
+  for (let i = 1; i < matNames.length; i++) {
+    if (lower.includes(matNames[i])) return i;
+  }
+  return null;
+}
+
+// ==================== SAMPLE PLAYBACK ====================
+
+function playSample(buffer, x, y, pan, time, vol, decayTime) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+
+  // Pitch by Y position: top = 2x, middle = 1x, bottom = 0.5x
+  src.playbackRate.value = Math.pow(2, ((H - y) / H) * 2 - 1);
+
+  const g = audioCtx.createGain();
+  const dur = Math.min(buffer.duration / src.playbackRate.value, decayTime);
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+
+  src.connect(g);
+  g.connect(p);
+  p.connect(compressor);
+  src.start(time);
+  src.stop(time + dur + 0.01);
+  src.onended = () => { src.disconnect(); g.disconnect(); p.disconnect(); };
+}
+
+// ==================== IMPACT SOUNDS ====================
+
+const MAX_TRIGGERS = 30;
+
+function processAudio() {
+  if (!audioEnabled || !audioCtx || muted) return;
+  soundsThisFrame = 0;
+
+  const eventCount = collisions.length;
+  for (let i = 0; i < eventCount && soundsThisFrame < MAX_TRIGGERS; i++) {
+    if (eventCount > MAX_TRIGGERS && Math.random() > MAX_TRIGGERS / eventCount) continue;
+    triggerCollisionSound(collisions[i]);
+    soundsThisFrame++;
+  }
+
+  const now = audioCtx.currentTime;
+  const sf = Math.min(1, sandFlowCount / 400) * 0.07;
+  const wf = Math.min(1, waterFlowCount / 250) * 0.05;
+  sandFlowGain.gain.setTargetAtTime(sf, now, 0.06);
+  waterFlowGain.gain.setTargetAtTime(wf, now, 0.06);
+}
+
+function triggerCollisionSound(evt) {
+  const { x, y, impactor, surface } = evt;
+  const pan = (x / W) * 2 - 1;
+  const now = audioCtx.currentTime;
+
+  // If a sample is loaded for this surface, play it instead of synth
+  if (materialSamples.has(surface)) {
+    const { buffer } = materialSamples.get(surface);
+    const vol = impactor === WATER ? 0.03 : 0.045;
+    playSample(buffer, x, y, pan, now, vol, 0.5);
+    return;
+  }
+
+  // Synthesized fallback
+  switch (surface) {
+    case METAL: triggerMetalPing(x, y, pan, now, impactor); break;
+    case GLASS: triggerGlassChime(x, y, pan, now, impactor); break;
+    case STONE: noiseImpact(pan, now, 300, 0.4, 0.022, 0.05); break;
+    case WOOD:  noiseImpact(pan, now, 700, 1.8, 0.04, 0.045); break;
+    case SAND:  noiseImpact(pan, now, 5000, 0.7, 0.008, 0.015); break;
+    case WATER: noiseImpact(pan, now, 400, 4.0, 0.055, 0.035); break;
+    default:    noiseImpact(pan, now, 300, 0.4, 0.022, 0.04);
+  }
+}
+
+function noiseImpact(pan, time, freq, Q, decay, vol) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer;
+  const flt = audioCtx.createBiquadFilter();
+  flt.type = 'bandpass';
+  flt.frequency.value = freq + (Math.random() - 0.5) * freq * 0.2;
+  flt.Q.value = Q;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + decay);
+  const p = audioCtx.createStereoPanner();
+  p.pan.value = pan;
+
+  src.connect(flt); flt.connect(g); g.connect(p); p.connect(compressor);
+  src.start(time);
+  src.stop(time + decay + 0.01);
+  src.onended = () => { src.disconnect(); flt.disconnect(); g.disconnect(); p.disconnect(); };
+}
+
+function triggerMetalPing(x, y, pan, time, impactor) {
+  const noteIdx = Math.floor(((H - y) / H) * PENTA_FREQS.length);
+  const fundamental = PENTA_FREQS[Math.min(noteIdx, PENTA_FREQS.length - 1)];
+  const vol = impactor === WATER ? 0.035 : 0.045;
+  const decay = 0.45;
+
+  noiseImpact(pan, time, 2500, 1.0, 0.004, vol * 0.5);
+
+  const harmonics = [1, 2.76, 5.40];
+  for (const ratio of harmonics) {
+    const freq = fundamental * ratio;
+    if (freq > 12000) continue;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq + (Math.random() - 0.5) * 2;
+    const g = audioCtx.createGain();
+    const hVol = vol / (1 + ratio * 0.4);
+    g.gain.setValueAtTime(hVol, time);
+    g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan;
+    osc.connect(g); g.connect(p); p.connect(compressor);
+    osc.start(time);
+    osc.stop(time + decay + 0.02);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+  }
+}
+
+function triggerGlassChime(x, y, pan, time, impactor) {
+  const noteIdx = Math.floor(((H - y) / H) * GLASS_FREQS.length);
+  const fundamental = GLASS_FREQS[Math.min(noteIdx, GLASS_FREQS.length - 1)];
+  const vol = impactor === WATER ? 0.025 : 0.035;
+  const decay = 0.28;
+
+  noiseImpact(pan, time, 7000, 0.5, 0.003, vol * 0.4);
+
+  const harmonics = [1, 2.32, 4.5];
+  for (const ratio of harmonics) {
+    const freq = fundamental * ratio;
+    if (freq > 16000) continue;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq + (Math.random() - 0.5) * 3;
+    const g = audioCtx.createGain();
+    const hVol = vol / (1 + ratio * 0.5);
+    g.gain.setValueAtTime(hVol, time);
+    g.gain.exponentialRampToValueAtTime(0.00001, time + decay);
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan;
+    osc.connect(g); g.connect(p); p.connect(compressor);
+    osc.start(time);
+    osc.stop(time + decay + 0.02);
+    osc.onended = () => { osc.disconnect(); g.disconnect(); p.disconnect(); };
+  }
+}
+
+// ==================== RENDERING ====================
+function varyColor(base, amount) {
+  const v = (Math.random() - 0.5) * amount * 2;
+  return [
+    Math.max(0, Math.min(255, base[0] + v)) | 0,
+    Math.max(0, Math.min(255, base[1] + v)) | 0,
+    Math.max(0, Math.min(255, base[2] + v)) | 0,
+  ];
+}
+
+function matColor(mat) {
+  switch (mat) {
+    case SAND:  return varyColor([210, 180, 100], 15);
+    case WATER: return varyColor([40, 80, 200], 20);
+    case STONE: return varyColor([120, 120, 130], 10);
+    case METAL: return varyColor([170, 175, 182], 6);
+    case GLASS: return varyColor([180, 215, 250], 8);
+    case WOOD:  return varyColor([100, 65, 30], 10);
+    default:    return [26, 26, 46];
+  }
+}
+
+function render() {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = idx(x, y);
+      const mat = grid[i];
+      if (mat === EMPTY) {
+        pixels[i] = 0xFF2E1A1A;
+      } else {
+        const c = matColor(mat);
+        pixels[i] = (255 << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+      }
+    }
+  }
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(offscreen, 0, 0, W * SCALE, H * SCALE);
+}
+
+// ==================== INPUT ====================
+function canvasToGrid(e) {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    Math.floor((e.clientX - rect.left) / SCALE),
+    Math.floor((e.clientY - rect.top) / SCALE),
+  ];
+}
+
+function paint() {
+  const mat = rightDown ? EMPTY : material;
+  for (let dy = -brushSize; dy <= brushSize; dy++) {
+    for (let dx = -brushSize; dx <= brushSize; dx++) {
+      if (dx * dx + dy * dy > brushSize * brushSize) continue;
+      const px = mouseX + dx, py = mouseY + dy;
+      if (!inBounds(px, py)) continue;
+      const i = idx(px, py);
+      if (mat === EMPTY) {
+        grid[i] = EMPTY;
+      } else if (grid[i] === EMPTY) {
+        grid[i] = mat;
+      }
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', e => {
+  if (!audioEnabled) initAudio();
+  if (e.button === 2) rightDown = true;
+  else mouseDown = true;
+  [mouseX, mouseY] = canvasToGrid(e);
+  paint();
+});
+canvas.addEventListener('mousemove', e => {
+  [mouseX, mouseY] = canvasToGrid(e);
+  if (mouseDown || rightDown) paint();
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button === 2) rightDown = false;
+  else mouseDown = false;
+});
+canvas.addEventListener('mouseleave', () => { mouseDown = false; rightDown = false; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(12, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = 'Brush: ' + brushSize;
+}, { passive: false });
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k >= '0' && k <= '6') {
+    material = parseInt(k);
+    updateToolbar();
+  } else if (k === ' ') {
+    e.preventDefault();
+    paused = !paused;
+  } else if (k === 'c') {
+    grid.fill(0);
+    movedPrev.fill(0);
+    movedCur.fill(0);
+  } else if (k === 'f') {
+    toggleFxPanel();
+  } else if (k === 'm') {
+    muted = !muted;
+    if (audioEnabled) {
+      const badge = document.getElementById('audio-badge');
+      badge.textContent = muted ? 'muted' : 'audio on';
+      badge.className = muted ? 'off' : 'on';
+      if (muted) {
+        sandFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+        waterFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+      }
+    }
+  }
+});
+
+document.getElementById('vol').addEventListener('input', e => {
+  if (masterGain) masterGain.gain.value = parseInt(e.target.value) / 100;
+});
+
+document.getElementById('audio-badge').addEventListener('click', () => {
+  if (!audioEnabled) initAudio();
+  else {
+    muted = !muted;
+    const badge = document.getElementById('audio-badge');
+    badge.textContent = muted ? 'muted' : 'audio on';
+    badge.className = muted ? 'off' : 'on';
+    if (muted && sandFlowGain) {
+      sandFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+      waterFlowGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.02);
+    }
+  }
+});
+
+// ==================== TOOLBAR ====================
+function buildToolbar() {
+  const tb = document.getElementById('toolbar');
+  MAT_INFO.forEach((m, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn' + (i === material ? ' active' : '');
+    btn.dataset.mat = i;
+    const [r, g, b] = m.rgb;
+    const bg = i === 0 ? '#333' : `rgb(${r},${g},${b})`;
+    btn.innerHTML = `<div class="swatch" style="background:${bg}"></div><span>${m.name}</span><span class="key">${m.key}</span>`;
+    btn.addEventListener('click', () => {
+      if (!audioEnabled) initAudio();
+      material = i;
+      updateToolbar();
+    });
+    tb.appendChild(btn);
+  });
+  const sep = document.createElement('div');
+  sep.className = 'sep';
+  tb.appendChild(sep);
+  const bl = document.createElement('span');
+  bl.id = 'brush-label';
+  bl.style.fontSize = '11px';
+  bl.style.color = '#888';
+  bl.textContent = 'Brush: ' + brushSize;
+  tb.appendChild(bl);
+}
+
+function updateToolbar() {
+  document.querySelectorAll('.btn[data-mat]').forEach(btn => {
+    btn.classList.toggle('active', parseInt(btn.dataset.mat) === material);
+  });
+}
+
+// ==================== FX PANEL ====================
+
+function toggleFxPanel() {
+  const body = document.getElementById('fx-body');
+  const header = document.getElementById('fx-header');
+  const isOpen = body.style.display !== 'none';
+  body.style.display = isOpen ? 'none' : 'flex';
+  header.classList.toggle('open', !isOpen);
+  header.innerHTML = (isOpen ? '&#9654;' : '&#9660;') + ' Samples &amp; Effects';
+}
+
+function buildFxPanel() {
+  // Toggle
+  document.getElementById('fx-header').addEventListener('click', toggleFxPanel);
+
+  // Sample slots for each non-empty material
+  const slotsDiv = document.getElementById('sample-slots');
+  for (let matId = 1; matId <= 6; matId++) {
+    const info = MAT_INFO[matId];
+    const [r, g, b] = info.rgb;
+
+    const slot = document.createElement('div');
+    slot.className = 'sample-slot';
+    slot.id = `sample-slot-${matId}`;
+
+    slot.innerHTML = `
+      <div class="mat-swatch" style="background:rgb(${r},${g},${b})"></div>
+      <span class="mat-name">${info.name}</span>
+      <span class="sample-name empty" id="sample-name-${matId}">no sample</span>
+      <button class="sample-btn" id="sample-load-${matId}">Load</button>
+      <button class="sample-btn preview" id="sample-preview-${matId}" style="display:none">&#9654;</button>
+      <button class="sample-btn clear" id="sample-clear-${matId}" style="display:none">&#10005;</button>
+      <input type="file" id="sample-file-${matId}" accept=".wav,.mp3,.ogg,.flac,.aif,.aiff" style="display:none">
+    `;
+    slotsDiv.appendChild(slot);
+
+    // Wire events
+    const fileInput = slot.querySelector(`#sample-file-${matId}`);
+    slot.querySelector(`#sample-load-${matId}`).addEventListener('click', () => {
+      if (!audioEnabled) initAudio();
+      fileInput.click();
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        if (!audioEnabled) initAudio();
+        loadSampleFromFile(fileInput.files[0], matId);
+      }
+    });
+    slot.querySelector(`#sample-preview-${matId}`).addEventListener('click', () => {
+      previewSample(matId);
+    });
+    slot.querySelector(`#sample-clear-${matId}`).addEventListener('click', () => {
+      clearSample(matId);
+    });
+  }
+
+  // Drop zone
+  const dropZone = document.getElementById('drop-zone');
+  dropZone.addEventListener('dragover', e => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+  });
+  dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+  });
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (!audioEnabled) initAudio();
+    for (const file of e.dataTransfer.files) {
+      const matId = matchFilenameToMaterial(file.name);
+      if (matId !== null) {
+        loadSampleFromFile(file, matId);
+      } else {
+        // No match — load into first empty slot, or prompt
+        for (let m = 1; m <= 6; m++) {
+          if (!materialSamples.has(m)) {
+            loadSampleFromFile(file, m);
+            break;
+          }
+        }
+      }
+    }
+  });
+  // Also allow clicking the drop zone to open a multi-file dialog
+  const dropFileInput = document.createElement('input');
+  dropFileInput.type = 'file';
+  dropFileInput.accept = '.wav,.mp3,.ogg,.flac,.aif,.aiff';
+  dropFileInput.multiple = true;
+  dropFileInput.style.display = 'none';
+  dropZone.appendChild(dropFileInput);
+  dropZone.addEventListener('click', () => {
+    if (!audioEnabled) initAudio();
+    dropFileInput.click();
+  });
+  dropFileInput.addEventListener('change', () => {
+    for (const file of dropFileInput.files) {
+      const matId = matchFilenameToMaterial(file.name);
+      if (matId !== null) {
+        loadSampleFromFile(file, matId);
+      } else {
+        for (let m = 1; m <= 6; m++) {
+          if (!materialSamples.has(m)) {
+            loadSampleFromFile(file, m);
+            break;
+          }
+        }
+      }
+    }
+  });
+
+  // Reverb controls
+  document.getElementById('reverb-ir').addEventListener('change', e => {
+    if (!audioEnabled) initAudio();
+    setReverbIR(e.target.value);
+  });
+  document.getElementById('reverb-wet').addEventListener('input', e => {
+    const val = parseInt(e.target.value);
+    document.getElementById('reverb-wet-val').textContent = val + '%';
+    if (wetGain) wetGain.gain.setTargetAtTime(val / 100, audioCtx.currentTime, 0.05);
+  });
+  document.getElementById('reverb-dry').addEventListener('input', e => {
+    const val = parseInt(e.target.value);
+    document.getElementById('reverb-dry-val').textContent = val + '%';
+    if (dryGain) dryGain.gain.setTargetAtTime(val / 100, audioCtx.currentTime, 0.05);
+  });
+
+  // Custom IR file loader
+  document.getElementById('ir-file').addEventListener('change', async e => {
+    if (e.target.files.length > 0) {
+      if (!audioEnabled) initAudio();
+      try {
+        const arrayBuf = await e.target.files[0].arrayBuffer();
+        const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+        convolverNode.buffer = audioBuf;
+        // If wet was 0, bump to a nice default
+        const wetSlider = document.getElementById('reverb-wet');
+        if (parseInt(wetSlider.value) === 0) {
+          wetSlider.value = 25;
+          document.getElementById('reverb-wet-val').textContent = '25%';
+          wetGain.gain.setTargetAtTime(0.25, audioCtx.currentTime, 0.05);
+        }
+      } catch (err) {
+        console.error('Failed to decode IR file:', err);
+        document.getElementById('reverb-ir').value = 'none';
+      }
+    }
+  });
+
+  // Filter controls
+  document.getElementById('filter-type').addEventListener('change', e => {
+    if (biquadFx) biquadFx.type = e.target.value;
+  });
+
+  const freqSlider = document.getElementById('filter-freq');
+  freqSlider.addEventListener('input', e => {
+    // Logarithmic mapping: 0-100 → 20Hz-20000Hz
+    const val = parseInt(e.target.value);
+    const freq = 20 * Math.pow(1000, val / 100);
+    document.getElementById('filter-freq-val').textContent = freq < 1000
+      ? Math.round(freq) + ' Hz'
+      : (freq / 1000).toFixed(1) + ' kHz';
+    if (biquadFx) biquadFx.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.02);
+  });
+
+  const qSlider = document.getElementById('filter-q');
+  qSlider.addEventListener('input', e => {
+    // Logarithmic mapping: 0-100 → 0.1-20
+    const val = parseInt(e.target.value);
+    const q = 0.1 * Math.pow(200, val / 100);
+    document.getElementById('filter-q-val').textContent = q.toFixed(1);
+    if (biquadFx) biquadFx.Q.setTargetAtTime(q, audioCtx.currentTime, 0.02);
+  });
+
+  document.getElementById('filter-gain').addEventListener('input', e => {
+    const val = parseInt(e.target.value);
+    document.getElementById('filter-gain-val').textContent = val + ' dB';
+    if (biquadFx) biquadFx.gain.setTargetAtTime(val, audioCtx.currentTime, 0.02);
+  });
+}
+
+function updateSampleSlotUI(matId) {
+  const nameEl = document.getElementById(`sample-name-${matId}`);
+  const previewBtn = document.getElementById(`sample-preview-${matId}`);
+  const clearBtn = document.getElementById(`sample-clear-${matId}`);
+
+  if (materialSamples.has(matId)) {
+    const { name } = materialSamples.get(matId);
+    nameEl.textContent = name;
+    nameEl.classList.remove('empty');
+    previewBtn.style.display = '';
+    clearBtn.style.display = '';
+  } else {
+    nameEl.textContent = 'no sample';
+    nameEl.classList.add('empty');
+    previewBtn.style.display = 'none';
+    clearBtn.style.display = 'none';
+  }
+}
+
+// ==================== MAIN LOOP ====================
+let particleCount = 0;
+
+function countParticles() {
+  let c = 0;
+  for (let i = 0; i < grid.length; i++) if (grid[i] !== EMPTY) c++;
+  return c;
+}
+
+function loop() {
+  if (!paused) {
+    simulate();
+    processAudio();
+  }
+  render();
+
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime > 500) {
+    currentFps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
+    frameCount = 0;
+    lastFpsTime = now;
+    particleCount = countParticles();
+    document.getElementById('fps').textContent = currentFps + ' fps';
+    document.getElementById('particles').textContent = particleCount + ' particles';
+    document.getElementById('collisions-display').textContent = soundsThisFrame + ' sounds';
+  }
+
+  requestAnimationFrame(loop);
+}
+
+buildToolbar();
+buildFxPanel();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

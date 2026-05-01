@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spark's Falling Sand — WebGPU</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: #e0e0e0; padding: 10px; }
+canvas { border: 2px solid #444; cursor: crosshair; image-rendering: pixelated; }
+.toolbar { display: flex; gap: 4px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; max-width: 1020px; justify-content: center; }
+.btn { padding: 4px 8px; border: 1px solid #555; background: #2a2a3e; color: #e0e0e0; cursor: pointer; border-radius: 3px; font-family: monospace; font-size: 11px; line-height: 1.2; transition: background 0.1s; }
+.btn.active { border-color: #fff; background: #3a3a5e; }
+.btn:hover { background: #3a3a5e; }
+.btn .key { font-size: 9px; color: #888; display: block; }
+.sep { width: 1px; height: 28px; background: #444; margin: 0 4px; }
+h1 { font-size: 14px; margin-bottom: 6px; color: #888; }
+.status { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #666; }
+.status .warn { color: #c44; }
+.status .gpu { color: #4a8; }
+.info { margin-top: 4px; font-size: 10px; color: #555; max-width: 1020px; text-align: center; }
+#error { color: #c44; margin: 40px; font-size: 14px; display: none; }
+</style>
+</head>
+<body>
+<h1>falling sand — webgpu compute shaders</h1>
+<div class="toolbar" id="toolbar"></div>
+<canvas id="c"></canvas>
+<div class="status">
+  <span id="fps">60 fps</span>
+  <span id="particles">0 particles</span>
+  <span id="brush-label">Brush: 3</span>
+  <span id="mode-label"></span>
+  <span id="gpu-label" class="gpu">WebGPU</span>
+</div>
+<div class="info">Draw: click+drag · Brush: scroll · 1-9/Q-T/Y-O: materials · 0: erase · V: thermal · Space: pause · C: clear</div>
+<div id="error"></div>
+
+<script>
+const W = 300, H = 200, SCALE = 3;
+const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, FIRE = 4, WOOD = 5, OIL = 6, GUNPOWDER = 7;
+const STEAM = 8, ACID = 9, LAVA = 10, ICE = 11, SMOKE = 12, PLANT = 13, SALT = 14, METAL = 15;
+const GAS = 16, CLONE = 17, VOID = 18, EMBER = 19;
+
+// ==================== WGSL COMMON ====================
+const WGSL_COMMON = `
+struct Params {
+  width: u32, height: u32, frame: u32, step_offset: u32,
+  mouse_x: i32, mouse_y: i32, mouse_down: u32, brush_material: u32,
+  brush_size: i32, paused: u32, scale: u32, show_temp: u32,
+};
+
+const MT_EMPTY: u32 = 0u; const MT_SAND: u32 = 1u; const MT_WATER: u32 = 2u;
+const MT_STONE: u32 = 3u; const MT_FIRE: u32 = 4u; const MT_WOOD: u32 = 5u;
+const MT_OIL: u32 = 6u; const MT_GUNPOWDER: u32 = 7u; const MT_STEAM: u32 = 8u;
+const MT_ACID: u32 = 9u; const MT_LAVA: u32 = 10u; const MT_ICE: u32 = 11u;
+const MT_SMOKE: u32 = 12u; const MT_PLANT: u32 = 13u; const MT_SALT: u32 = 14u;
+const MT_METAL: u32 = 15u; const MT_GAS: u32 = 16u; const MT_CLONE: u32 = 17u;
+const MT_VOID: u32 = 18u; const MT_EMBER: u32 = 19u;
+const ROOM_TEMP: f32 = 22.0;
+
+const DENSITY_TBL = array<f32, 20>(0.0, 4.0, 3.0, 8.0, 0.0, 5.0, 2.0, 4.0, 0.0, 3.0, 7.0, 3.0, 0.0, 5.0, 4.0, 9.0, 0.0, 10.0, 10.0, 0.0);
+const CONDUCT_TBL = array<f32, 20>(0.02, 0.3, 0.6, 0.5, 0.1, 0.08, 0.12, 0.2, 0.04, 0.5, 0.8, 0.8, 0.02, 0.08, 0.3, 0.95, 0.05, 0.0, 0.0, 0.3);
+
+fn pcg(v: u32) -> u32 {
+  var s = v * 747796405u + 2891336453u;
+  var w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn rand(seed: ptr<function, u32>) -> f32 {
+  *seed = pcg(*seed);
+  return f32(*seed) / 4294967295.0;
+}
+fn pack(m: u32, l: u32) -> u32 { return (min(l, 255u) << 8u) | (m & 0xFFu); }
+fn mt(c: u32) -> u32 { return c & 0xFFu; }
+fn age(c: u32) -> u32 { return (c >> 8u) & 0xFFu; }
+
+fn is_powder(m: u32) -> bool { return m == MT_SAND || m == MT_GUNPOWDER || m == MT_SALT; }
+fn is_liquid(m: u32) -> bool { return m == MT_WATER || m == MT_OIL || m == MT_ACID || m == MT_LAVA; }
+fn is_gas(m: u32) -> bool { return m == MT_STEAM || m == MT_SMOKE || m == MT_GAS || m == MT_EMBER; }
+fn is_solid(m: u32) -> bool { return m == MT_STONE || m == MT_WOOD || m == MT_ICE || m == MT_PLANT || m == MT_METAL || m == MT_CLONE || m == MT_VOID; }
+fn does_fall(m: u32) -> bool { return is_powder(m) || is_liquid(m); }
+fn does_rise(m: u32) -> bool { return m == MT_STEAM || m == MT_SMOKE || m == MT_FIRE || m == MT_EMBER || m == MT_GAS; }
+
+fn density_of(m: u32) -> f32 { return DENSITY_TBL[min(m, 19u)]; }
+fn conduct_of(m: u32) -> f32 { return CONDUCT_TBL[min(m, 19u)]; }
+
+fn can_displace(mover: u32, target: u32) -> bool {
+  if (target == MT_EMPTY) { return true; }
+  if (is_solid(target)) { return false; }
+  if (is_gas(mover)) { return false; }
+  return density_of(mover) > density_of(target);
+}
+
+fn has_any(n: u32, s: u32, w: u32, e: u32, t: u32) -> bool {
+  return n == t || s == t || w == t || e == t;
+}
+`;
+
+// ==================== INTERACTION COMPUTE SHADER ====================
+const WGSL_INTERACTION = WGSL_COMMON + `
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> grid_in: array<u32>;
+@group(0) @binding(2) var<storage, read> temp_in: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grid_out: array<u32>;
+@group(0) @binding(4) var<storage, read_write> temp_out: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let x = id.x; let y = id.y;
+  if (x >= params.width || y >= params.height) { return; }
+  let i = y * params.width + x;
+
+  let cell = grid_in[i];
+  let m = mt(cell);
+  let my_life = age(cell);
+  let my_temp = temp_in[i];
+
+  var out_m = m;
+  var out_life = my_life;
+  var out_temp = my_temp;
+  var seed = pcg(x * 374761393u + y * 668265263u + params.frame * 1013904223u);
+
+  // Read neighbors (default STONE at boundaries)
+  let has_n = y > 0u; let has_s = y < params.height - 1u;
+  let has_w = x > 0u; let has_e = x < params.width - 1u;
+  let ni_n = select(0u, (y - 1u) * params.width + x, has_n);
+  let ni_s = select(0u, (y + 1u) * params.width + x, has_s);
+  let ni_w = select(0u, y * params.width + (x - 1u), has_w);
+  let ni_e = select(0u, y * params.width + (x + 1u), has_e);
+  let nm = select(MT_STONE, mt(grid_in[ni_n]), has_n);
+  let sm = select(MT_STONE, mt(grid_in[ni_s]), has_s);
+  let wm = select(MT_STONE, mt(grid_in[ni_w]), has_w);
+  let em = select(MT_STONE, mt(grid_in[ni_e]), has_e);
+  let nt = select(ROOM_TEMP, temp_in[ni_n], has_n);
+  let st = select(ROOM_TEMP, temp_in[ni_s], has_s);
+  let wt = select(ROOM_TEMP, temp_in[ni_w], has_w);
+  let et = select(ROOM_TEMP, temp_in[ni_e], has_e);
+
+  // ===== THERMAL =====
+  if (m == MT_EMPTY) {
+    if (abs(out_temp - ROOM_TEMP) < 0.5) { out_temp = ROOM_TEMP; }
+    else { out_temp = out_temp + (ROOM_TEMP - out_temp) * 0.1; }
+  } else if (m != MT_CLONE && m != MT_VOID) {
+    if (m == MT_FIRE) { out_temp = max(out_temp, 400.0 + rand(&seed) * 200.0); }
+    else if (m == MT_LAVA) { out_temp = max(out_temp, 700.0 + rand(&seed) * 150.0); }
+    else if (m == MT_ICE) { out_temp = min(out_temp, -5.0); }
+    else if (m == MT_EMBER) { out_temp = max(out_temp, 300.0 + rand(&seed) * 100.0); }
+
+    let mc = conduct_of(m);
+    var hf = 0.0; var nc = 0.0;
+    if (has_n) { hf += (nt - my_temp) * (mc + conduct_of(nm)) * 0.5; nc += 1.0; }
+    if (has_s) { hf += (st - my_temp) * (mc + conduct_of(sm)) * 0.5; nc += 1.0; }
+    if (has_w) { hf += (wt - my_temp) * (mc + conduct_of(wm)) * 0.5; nc += 1.0; }
+    if (has_e) { hf += (et - my_temp) * (mc + conduct_of(em)) * 0.5; nc += 1.0; }
+    if (nc > 0.0) { out_temp = out_temp + hf / nc * 0.15; }
+    out_temp = out_temp + (ROOM_TEMP - out_temp) * 0.001;
+    out_temp = clamp(out_temp, -50.0, 1200.0);
+  }
+
+  // ===== PHASE TRANSITIONS =====
+  if (out_m == MT_WATER && out_temp >= 100.0) { out_m = MT_STEAM; out_life = 0u; }
+  else if (out_m == MT_WATER && out_temp <= -2.0) { out_m = MT_ICE; }
+  else if (out_m == MT_ICE && out_temp > 5.0) { out_m = MT_WATER; }
+  else if (out_m == MT_STEAM && out_temp < 85.0) { out_m = MT_WATER; out_life = 0u; }
+  else if (out_m == MT_LAVA && out_temp < 400.0) { out_m = MT_STONE; out_temp = 350.0; }
+  else if (out_m == MT_STONE && out_temp > 900.0 && rand(&seed) < 0.01) { out_m = MT_LAVA; }
+  else if (out_m == MT_METAL && out_temp > 650.0 && rand(&seed) < 0.01) { out_m = MT_LAVA; out_temp = 700.0; }
+  else if (out_m == MT_WOOD && out_temp > 300.0) { out_m = MT_FIRE; out_life = 0u; }
+  else if (out_m == MT_OIL && out_temp > 150.0) { out_m = MT_FIRE; out_life = 0u; }
+  else if (out_m == MT_GUNPOWDER && out_temp > 100.0) { out_m = MT_FIRE; out_life = 0u; out_temp = 600.0; }
+  else if (out_m == MT_PLANT && out_temp > 250.0) { out_m = MT_FIRE; out_life = 0u; }
+  else if (out_m == MT_GAS && out_temp > 50.0) { out_m = MT_FIRE; out_life = 0u; out_temp = max(out_temp, 400.0); }
+
+  // ===== CHEMICAL REACTIONS =====
+  // Water + Lava → Steam
+  if (out_m == MT_WATER && has_any(nm, sm, wm, em, MT_LAVA)) {
+    out_m = MT_STEAM; out_life = 0u; out_temp = 110.0;
+  }
+  // Lava + Water → cool
+  if (out_m == MT_LAVA && has_any(nm, sm, wm, em, MT_WATER)) {
+    out_temp = out_temp - 100.0;
+    if (out_temp < 400.0) { out_m = MT_STONE; out_temp = 350.0; }
+  }
+  if (out_m == MT_LAVA && has_any(nm, sm, wm, em, MT_ICE)) { out_temp = out_temp - 50.0; }
+
+  // Fire + Water → Steam
+  if (out_m == MT_FIRE && has_any(nm, sm, wm, em, MT_WATER)) {
+    out_m = MT_STEAM; out_life = 0u; out_temp = 100.0;
+  }
+  // Ember + Water → Steam
+  if (out_m == MT_EMBER && has_any(nm, sm, wm, em, MT_WATER)) {
+    out_m = MT_STEAM; out_life = 0u; out_temp = 100.0;
+  }
+  // Gas ignition
+  if (out_m == MT_GAS && (has_any(nm, sm, wm, em, MT_FIRE) || has_any(nm, sm, wm, em, MT_EMBER) || has_any(nm, sm, wm, em, MT_LAVA))) {
+    out_m = MT_FIRE; out_life = 0u; out_temp = 400.0;
+  }
+  // Acid dissolves target (pull: I'm the target)
+  if (out_m != MT_EMPTY && out_m != MT_ACID && out_m != MT_STONE && out_m != MT_LAVA && out_m != MT_CLONE && out_m != MT_VOID) {
+    if (has_any(nm, sm, wm, em, MT_ACID) && rand(&seed) < 0.03) {
+      out_m = MT_EMPTY; out_temp = ROOM_TEMP; out_life = 0u;
+    }
+  }
+  // Acid + Water → neutralize
+  if (out_m == MT_ACID && has_any(nm, sm, wm, em, MT_WATER) && rand(&seed) < 0.08) {
+    out_m = MT_EMPTY; out_temp = ROOM_TEMP;
+  }
+  // Acid + Metal
+  if (out_m == MT_ACID && has_any(nm, sm, wm, em, MT_METAL) && rand(&seed) < 0.02) {
+    out_m = MT_SMOKE; out_life = 0u;
+  }
+  if (out_m == MT_METAL && has_any(nm, sm, wm, em, MT_ACID) && rand(&seed) < 0.02) {
+    out_m = MT_GAS; out_life = 0u; out_temp = 30.0;
+  }
+  // Salt dissolves in water
+  if (out_m == MT_SALT && has_any(nm, sm, wm, em, MT_WATER) && rand(&seed) < 0.05) {
+    out_m = MT_EMPTY; out_temp = ROOM_TEMP;
+  }
+  // Smoke + Water → disappear
+  if (out_m == MT_SMOKE && has_any(nm, sm, wm, em, MT_WATER)) {
+    out_m = MT_EMPTY; out_life = 0u;
+  }
+
+  // ===== LIFETIME AGING =====
+  if (out_m == MT_FIRE) {
+    out_life = out_life + 1u;
+    if (out_life > u32(20.0 + rand(&seed) * 30.0)) {
+      let r = rand(&seed);
+      if (r < 0.35) { out_m = MT_SMOKE; out_life = 0u; }
+      else if (r < 0.45) { out_m = MT_EMBER; out_life = 0u; out_temp = 350.0; }
+      else { out_m = MT_EMPTY; out_life = 0u; out_temp = ROOM_TEMP; }
+    }
+  }
+  if (out_m == MT_STEAM) {
+    out_life = out_life + 1u;
+    if (out_life > u32(80.0 + rand(&seed) * 40.0)) { out_m = MT_WATER; out_life = 0u; }
+  }
+  if (out_m == MT_SMOKE) {
+    out_life = out_life + 1u;
+    if (out_life > u32(60.0 + rand(&seed) * 30.0)) { out_m = MT_EMPTY; out_life = 0u; }
+  }
+  if (out_m == MT_EMBER) {
+    out_life = out_life + 1u;
+    if (out_life > u32(10.0 + rand(&seed) * 15.0)) { out_m = MT_EMPTY; out_life = 0u; out_temp = ROOM_TEMP; }
+  }
+  if (out_m == MT_GAS) {
+    out_life = out_life + 1u;
+    if (out_life > u32(150.0 + rand(&seed) * 80.0)) { out_m = MT_EMPTY; out_life = 0u; }
+  }
+
+  // ===== FIRE HEATS FLAMMABLES (pull: I'm the flammable) =====
+  if (out_m == MT_WOOD || out_m == MT_OIL || out_m == MT_PLANT || out_m == MT_GUNPOWDER) {
+    var fire_n = 0u;
+    if (nm == MT_FIRE || nm == MT_EMBER) { fire_n = fire_n + 1u; }
+    if (sm == MT_FIRE || sm == MT_EMBER) { fire_n = fire_n + 1u; }
+    if (wm == MT_FIRE || wm == MT_EMBER) { fire_n = fire_n + 1u; }
+    if (em == MT_FIRE || em == MT_EMBER) { fire_n = fire_n + 1u; }
+    out_temp = out_temp + f32(fire_n) * 2.0;
+  }
+
+  // ===== PULL-BASED SPAWNING (empty cell) =====
+  if (m == MT_EMPTY && out_m == MT_EMPTY) {
+    // Fire below → smoke
+    if (sm == MT_FIRE && rand(&seed) < 0.06) {
+      out_m = MT_SMOKE; out_life = 0u;
+    }
+    // Plant growth
+    if (out_m == MT_EMPTY) {
+      var plant_near = nm == MT_PLANT || sm == MT_PLANT || wm == MT_PLANT || em == MT_PLANT;
+      if (plant_near) {
+        var water_near = nm == MT_WATER || sm == MT_WATER || wm == MT_WATER || em == MT_WATER;
+        var grow_rate = select(0.001, 0.008, water_near);
+        if (rand(&seed) < grow_rate) { out_m = MT_PLANT; out_life = 0u; }
+      }
+    }
+    // Clone (pull: empty cell next to clone → become cloned material)
+    if (out_m == MT_EMPTY) {
+      var cx = 0i; var cy = 0i; var found_clone = false;
+      if (nm == MT_CLONE) { cx = i32(x); cy = i32(y) - 1; found_clone = true; }
+      else if (sm == MT_CLONE) { cx = i32(x); cy = i32(y) + 1; found_clone = true; }
+      else if (wm == MT_CLONE) { cx = i32(x) - 1; cy = i32(y); found_clone = true; }
+      else if (em == MT_CLONE) { cx = i32(x) + 1; cy = i32(y); found_clone = true; }
+      if (found_clone && rand(&seed) < 0.1) {
+        var src = MT_EMPTY;
+        // Check clone's neighbors for source material
+        if (cy - 1 >= 0) { let cm = mt(grid_in[u32(cy - 1) * params.width + u32(cx)]); if (cm != MT_EMPTY && cm != MT_CLONE && cm != MT_VOID) { src = cm; } }
+        if (src == MT_EMPTY && u32(cy + 1) < params.height) { let cm = mt(grid_in[u32(cy + 1) * params.width + u32(cx)]); if (cm != MT_EMPTY && cm != MT_CLONE && cm != MT_VOID) { src = cm; } }
+        if (src == MT_EMPTY && cx - 1 >= 0) { let cm = mt(grid_in[u32(cy) * params.width + u32(cx - 1)]); if (cm != MT_EMPTY && cm != MT_CLONE && cm != MT_VOID) { src = cm; } }
+        if (src == MT_EMPTY && u32(cx + 1) < params.width) { let cm = mt(grid_in[u32(cy) * params.width + u32(cx + 1)]); if (cm != MT_EMPTY && cm != MT_CLONE && cm != MT_VOID) { src = cm; } }
+        if (src != MT_EMPTY) {
+          out_m = src; out_life = 0u;
+          if (src == MT_FIRE) { out_temp = 500.0; }
+          else if (src == MT_LAVA) { out_temp = 800.0; }
+          else if (src == MT_ICE) { out_temp = -10.0; }
+          else if (src == MT_EMBER) { out_temp = 350.0; }
+          else { out_temp = ROOM_TEMP; }
+        }
+      }
+    }
+  }
+
+  // ===== VOID DELETION (pull: non-void next to void → empty) =====
+  if (out_m != MT_EMPTY && out_m != MT_VOID && out_m != MT_CLONE) {
+    if (has_any(nm, sm, wm, em, MT_VOID)) {
+      out_m = MT_EMPTY; out_temp = ROOM_TEMP; out_life = 0u;
+    }
+  }
+
+  grid_out[i] = pack(out_m, out_life);
+  temp_out[i] = out_temp;
+}
+`;
+
+// ==================== MOVEMENT COMPUTE SHADER (Margolus Block CA) ====================
+const WGSL_MOVEMENT = WGSL_COMMON + `
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> grid: array<u32>;
+@group(0) @binding(2) var<storage, read_write> temps: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let bx = id.x; let by = id.y;
+  let off = params.step_offset;
+  let ox = bx * 2u + (off & 1u);
+  let oy = by * 2u + ((off >> 1u) & 1u);
+
+  if (ox + 1u >= params.width || oy + 1u >= params.height) { return; }
+
+  let i0 = oy * params.width + ox;         // TL
+  let i1 = oy * params.width + ox + 1u;    // TR
+  let i2 = (oy + 1u) * params.width + ox;  // BL
+  let i3 = (oy + 1u) * params.width + ox + 1u; // BR
+
+  var c = array<u32, 4>(grid[i0], grid[i1], grid[i2], grid[i3]);
+  var t = array<f32, 4>(temps[i0], temps[i1], temps[i2], temps[i3]);
+  var sw = array<bool, 4>(false, false, false, false);
+  var seed = pcg(ox * 374761393u + oy * 668265263u + params.frame * 2654435761u + off * 48271u);
+
+  // Swap helper (inline since WGSL has no closures)
+  // After swap, update c[] and t[] and mark sw[]
+
+  // === 1. VERTICAL GRAVITY: TL→BL, TR→BR ===
+  let m0 = mt(c[0]); let m1 = mt(c[1]); let m2 = mt(c[2]); let m3 = mt(c[3]);
+
+  // Lava viscosity: 30% chance to skip
+  let f0 = does_fall(m0) && !(m0 == MT_LAVA && rand(&seed) < 0.3);
+  let f1 = does_fall(m1) && !(m1 == MT_LAVA && rand(&seed) < 0.3);
+
+  if (!sw[0] && !sw[2] && f0 && can_displace(m0, m2)) {
+    let tc = c[0]; c[0] = c[2]; c[2] = tc;
+    let tt = t[0]; t[0] = t[2]; t[2] = tt;
+    sw[0] = true; sw[2] = true;
+  }
+  if (!sw[1] && !sw[3] && f1 && can_displace(m1, m3)) {
+    let tc = c[1]; c[1] = c[3]; c[3] = tc;
+    let tt = t[1]; t[1] = t[3]; t[3] = tt;
+    sw[1] = true; sw[3] = true;
+  }
+
+  // === 2. DIAGONAL GRAVITY ===
+  let diag_lr = rand(&seed) > 0.5;
+  if (diag_lr) {
+    if (!sw[0] && !sw[3] && does_fall(mt(c[0])) && can_displace(mt(c[0]), mt(c[3]))) {
+      let tc = c[0]; c[0] = c[3]; c[3] = tc;
+      let tt = t[0]; t[0] = t[3]; t[3] = tt;
+      sw[0] = true; sw[3] = true;
+    }
+    if (!sw[1] && !sw[2] && does_fall(mt(c[1])) && can_displace(mt(c[1]), mt(c[2]))) {
+      let tc = c[1]; c[1] = c[2]; c[2] = tc;
+      let tt = t[1]; t[1] = t[2]; t[2] = tt;
+      sw[1] = true; sw[2] = true;
+    }
+  } else {
+    if (!sw[1] && !sw[2] && does_fall(mt(c[1])) && can_displace(mt(c[1]), mt(c[2]))) {
+      let tc = c[1]; c[1] = c[2]; c[2] = tc;
+      let tt = t[1]; t[1] = t[2]; t[2] = tt;
+      sw[1] = true; sw[2] = true;
+    }
+    if (!sw[0] && !sw[3] && does_fall(mt(c[0])) && can_displace(mt(c[0]), mt(c[3]))) {
+      let tc = c[0]; c[0] = c[3]; c[3] = tc;
+      let tt = t[0]; t[0] = t[3]; t[3] = tt;
+      sw[0] = true; sw[3] = true;
+    }
+  }
+
+  // === 3. VERTICAL RISING: BL→TL, BR→TR ===
+  let r2 = does_rise(mt(c[2])) && !(mt(c[2]) == MT_FIRE && rand(&seed) > 0.35);
+  let r3 = does_rise(mt(c[3])) && !(mt(c[3]) == MT_FIRE && rand(&seed) > 0.35);
+  if (!sw[2] && !sw[0] && r2 && (mt(c[0]) == MT_EMPTY || (is_liquid(mt(c[0])) && mt(c[2]) == MT_STEAM))) {
+    let tc = c[2]; c[2] = c[0]; c[0] = tc;
+    let tt = t[2]; t[2] = t[0]; t[0] = tt;
+    sw[2] = true; sw[0] = true;
+  }
+  if (!sw[3] && !sw[1] && r3 && (mt(c[1]) == MT_EMPTY || (is_liquid(mt(c[1])) && mt(c[3]) == MT_STEAM))) {
+    let tc = c[3]; c[3] = c[1]; c[1] = tc;
+    let tt = t[3]; t[3] = t[1]; t[1] = tt;
+    sw[3] = true; sw[1] = true;
+  }
+
+  // === 4. DIAGONAL RISING ===
+  if (!sw[2] && !sw[1] && does_rise(mt(c[2])) && mt(c[1]) == MT_EMPTY) {
+    let tc = c[2]; c[2] = c[1]; c[1] = tc;
+    let tt = t[2]; t[2] = t[1]; t[1] = tt;
+    sw[2] = true; sw[1] = true;
+  }
+  if (!sw[3] && !sw[0] && does_rise(mt(c[3])) && mt(c[0]) == MT_EMPTY) {
+    let tc = c[3]; c[3] = c[0]; c[0] = tc;
+    let tt = t[3]; t[3] = t[0]; t[0] = tt;
+    sw[3] = true; sw[0] = true;
+  }
+
+  // === 5. HORIZONTAL FLOW ===
+  let h_dir = rand(&seed) > 0.5;
+  if (h_dir) {
+    if (!sw[0] && !sw[1] && (is_liquid(mt(c[0])) || is_gas(mt(c[0]))) && mt(c[1]) == MT_EMPTY && rand(&seed) < 0.6) {
+      let tc = c[0]; c[0] = c[1]; c[1] = tc;
+      let tt = t[0]; t[0] = t[1]; t[1] = tt;
+      sw[0] = true; sw[1] = true;
+    }
+    if (!sw[2] && !sw[3] && (is_liquid(mt(c[2])) || is_gas(mt(c[2]))) && mt(c[3]) == MT_EMPTY && rand(&seed) < 0.6) {
+      let tc = c[2]; c[2] = c[3]; c[3] = tc;
+      let tt = t[2]; t[2] = t[3]; t[3] = tt;
+      sw[2] = true; sw[3] = true;
+    }
+  } else {
+    if (!sw[1] && !sw[0] && (is_liquid(mt(c[1])) || is_gas(mt(c[1]))) && mt(c[0]) == MT_EMPTY && rand(&seed) < 0.6) {
+      let tc = c[1]; c[1] = c[0]; c[0] = tc;
+      let tt = t[1]; t[1] = t[0]; t[0] = tt;
+      sw[1] = true; sw[0] = true;
+    }
+    if (!sw[3] && !sw[2] && (is_liquid(mt(c[3])) || is_gas(mt(c[3]))) && mt(c[2]) == MT_EMPTY && rand(&seed) < 0.6) {
+      let tc = c[3]; c[3] = c[2]; c[2] = tc;
+      let tt = t[3]; t[3] = t[2]; t[2] = tt;
+      sw[3] = true; sw[2] = true;
+    }
+  }
+
+  grid[i0] = c[0]; grid[i1] = c[1]; grid[i2] = c[2]; grid[i3] = c[3];
+  temps[i0] = t[0]; temps[i1] = t[1]; temps[i2] = t[2]; temps[i3] = t[3];
+}
+`;
+
+// ==================== PAINT COMPUTE SHADER ====================
+const WGSL_PAINT = WGSL_COMMON + `
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> grid: array<u32>;
+@group(0) @binding(2) var<storage, read_write> temps: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let x = id.x; let y = id.y;
+  if (x >= params.width || y >= params.height) { return; }
+  if (params.mouse_down == 0u) { return; }
+
+  let dx = f32(i32(x) - params.mouse_x);
+  let dy = f32(i32(y) - params.mouse_y);
+  let bs = f32(params.brush_size);
+  if (dx * dx + dy * dy > bs * bs) { return; }
+
+  let i = y * params.width + x;
+  let bm = params.brush_material;
+
+  if (bm == MT_EMPTY) {
+    grid[i] = pack(MT_EMPTY, 0u);
+    temps[i] = ROOM_TEMP;
+  } else if (mt(grid[i]) == MT_EMPTY) {
+    var seed = pcg(x * 374761393u + y * 668265263u + params.frame * 7919u);
+    if (rand(&seed) < 0.7) {
+      grid[i] = pack(bm, 0u);
+      if (bm == MT_FIRE) { temps[i] = 500.0; }
+      else if (bm == MT_LAVA) { temps[i] = 800.0; }
+      else if (bm == MT_ICE) { temps[i] = -10.0; }
+      else if (bm == MT_EMBER) { temps[i] = 350.0; }
+      else { temps[i] = ROOM_TEMP; }
+    }
+  }
+}
+`;
+
+// ==================== RENDER SHADERS ====================
+const WGSL_RENDER = WGSL_COMMON + `
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> grid: array<u32>;
+@group(0) @binding(2) var<storage, read> temps: array<f32>;
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+  return vec4(pos[vi], 0.0, 1.0);
+}
+
+fn mat_color(m: u32, tmp: f32, x: u32, y: u32, frame: u32) -> vec3<f32> {
+  var sv = f32(pcg(x * 374761393u + y * 668265263u) & 255u) / 255.0;
+  var av = f32(pcg(x * 374761393u + y * 668265263u + frame * 1013904223u) & 255u) / 255.0;
+  var r = 0.102; var g = 0.102; var b = 0.180; // background
+
+  switch m {
+    case 1u { let v = (sv - 0.5) * 0.12; r = 0.82 + v; g = 0.71 + v; b = 0.39 + v; }
+    case 2u { let v = (sv - 0.5) * 0.16; r = 0.16 + v; g = 0.31 + v; b = 0.78 + v; }
+    case 3u { let v = (sv - 0.5) * 0.08; r = 0.47 + v; g = 0.47 + v; b = 0.51 + v; }
+    case 4u { r = 1.0; g = 0.31 + av * 0.47; b = av * 0.16; }
+    case 5u { let v = (sv - 0.5) * 0.08; r = 0.39 + v; g = 0.25 + v; b = 0.12 + v; }
+    case 6u { let v = (sv - 0.5) * 0.06; r = 0.24 + v; g = 0.16 + v; b = 0.27 + v; }
+    case 7u { let v = (sv - 0.5) * 0.06; r = 0.31 + v; g = 0.31 + v; b = 0.31 + v; }
+    case 8u { r = 0.71 + av * 0.16; g = 0.71 + av * 0.16; b = 0.82 + av * 0.12; }
+    case 9u { let v = (sv - 0.5) * 0.20; r = 0.12 + v; g = 0.86 + v; b = 0.20 + v; }
+    case 10u {
+      if (av > 0.7) { r = 1.0; g = 0.71 + av * 0.29; b = 0.12 + av * 0.24; }
+      else { let v = (sv - 0.5) * 0.16; r = 0.78 + v; g = 0.24 + v; b = 0.04 + v; }
+    }
+    case 11u { let v = (sv - 0.5) * 0.06; r = 0.71 + v; g = 0.84 + v; b = 0.98 + v; }
+    case 12u { let base = 0.27 + av * 0.12; r = base; g = base; b = base + 0.02; }
+    case 13u { let v = (sv - 0.5) * 0.09; r = 0.12 + v; g = 0.55 + av * 0.16 + v; b = 0.14 + v; }
+    case 14u { let v = (sv - 0.5) * 0.06; r = 0.90 + v; g = 0.90 + v; b = 0.94 + v; }
+    case 15u { let v = (sv - 0.5) * 0.05; r = 0.67 + v; g = 0.69 + v; b = 0.71 + v; }
+    case 16u { let v = (sv - 0.5) * 0.16; r = 0.55 + v; g = 0.71 + v; b = 0.16 + v; }
+    case 17u { r = 0.20 + av * 0.16; g = 0.75 + av * 0.12; b = 0.78 + av * 0.12; }
+    case 18u {
+      if (av < 0.12) { r = 0.47; g = 0.12; b = 0.71; }
+      else { r = 0.08 + av * 0.06; g = 0.0; b = 0.12 + av * 0.06; }
+    }
+    case 19u { r = 1.0; g = 0.59 + av * 0.41; b = av * 0.20; }
+    default {}
+  }
+
+  // Thermal tint
+  if (m != 0u && m != 4u && m != 10u && m != 17u && m != 18u && m != 19u) {
+    if (tmp > 60.0) {
+      let f = min(1.0, (tmp - 60.0) / 400.0);
+      r = min(1.0, r + f * 0.47); g = min(1.0, g + f * 0.10); b = max(0.0, b - f * 0.24);
+    } else if (tmp < 5.0) {
+      let f = min(1.0, (5.0 - tmp) / 30.0);
+      r = max(0.0, r - f * 0.16); g = min(1.0, g + f * 0.06); b = min(1.0, b + f * 0.31);
+    }
+  }
+  return vec3(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0));
+}
+
+fn temp_heatmap(tmp: f32) -> vec3<f32> {
+  if (tmp < 0.0) {
+    let f = min(1.0, -tmp / 30.0);
+    return vec3(0.08, 0.16 + f * 0.31, 0.39 + f * 0.61);
+  }
+  if (tmp < 25.0) { return vec3(0.12, 0.12, 0.20); }
+  let hot = tmp - 25.0;
+  if (hot < 75.0) { let f = hot / 75.0; return vec3(f * 0.78, f * 0.59, 0.08); }
+  if (hot < 275.0) { let f = (hot - 75.0) / 200.0; return vec3(0.78 + f * 0.22, 0.59 - f * 0.39, 0.0); }
+  if (hot < 675.0) { let f = (hot - 275.0) / 400.0; return vec3(1.0, 0.20 + f * 0.51, f * 0.24); }
+  return vec3(1.0, 0.78, 0.39);
+}
+
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let gx = u32(pos.x) / params.scale;
+  let gy = u32(pos.y) / params.scale;
+  if (gx >= params.width || gy >= params.height) { return vec4(0.102, 0.102, 0.180, 1.0); }
+  let i = gy * params.width + gx;
+  let m = mt(grid[i]);
+  let tmp = temps[i];
+
+  var col: vec3<f32>;
+  if (params.show_temp != 0u) {
+    col = temp_heatmap(tmp);
+  } else {
+    col = mat_color(m, tmp, gx, gy, params.frame);
+  }
+  return vec4(col, 1.0);
+}
+`;
+
+// ==================== WebGPU INITIALIZATION ====================
+let device, context;
+let gridA, gridB, tempA, tempB, paramsBuffer0, paramsBuffer1;
+let interactionPipeline, movementPipeline, paintPipeline, renderPipeline;
+let interBG_AtoB, interBG_BtoA;
+let rwBG_A0, rwBG_A1, rwBG_B0, rwBG_B1;
+let renderBG_A, renderBG_B;
+
+let material = SAND;
+let brushSize = 3;
+let mouseDown = false;
+let mouseGX = 0, mouseGY = 0;
+let paused = false;
+let showTemp = false;
+let frameNum = 0;
+let lastFpsTime = performance.now();
+let fpsCount = 0;
+let currentFps = 60;
+
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+
+async function init() {
+  if (!navigator.gpu) throw new Error('WebGPU not supported in this browser');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter found');
+  device = await adapter.requestDevice();
+
+  context = canvas.getContext('webgpu');
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format: fmt, alphaMode: 'premultiplied' });
+
+  const cellCount = W * H;
+  const gridSize = cellCount * 4;
+  const BUF = GPUBufferUsage;
+
+  gridA = device.createBuffer({ size: gridSize, usage: BUF.STORAGE | BUF.COPY_DST });
+  gridB = device.createBuffer({ size: gridSize, usage: BUF.STORAGE | BUF.COPY_DST });
+  tempA = device.createBuffer({ size: gridSize, usage: BUF.STORAGE | BUF.COPY_DST });
+  tempB = device.createBuffer({ size: gridSize, usage: BUF.STORAGE | BUF.COPY_DST });
+  paramsBuffer0 = device.createBuffer({ size: 48, usage: BUF.UNIFORM | BUF.COPY_DST });
+  paramsBuffer1 = device.createBuffer({ size: 48, usage: BUF.UNIFORM | BUF.COPY_DST });
+
+  // Init data
+  const initGrid = new Uint32Array(cellCount);
+  const initTemp = new Float32Array(cellCount).fill(22.0);
+  device.queue.writeBuffer(gridA, 0, initGrid);
+  device.queue.writeBuffer(gridB, 0, initGrid);
+  device.queue.writeBuffer(tempA, 0, initTemp);
+  device.queue.writeBuffer(tempB, 0, initTemp);
+
+  // Layouts
+  const interLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const rwLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const renderLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+  ]});
+
+  // Pipelines
+  const interModule = device.createShaderModule({ code: WGSL_INTERACTION });
+  const moveModule = device.createShaderModule({ code: WGSL_MOVEMENT });
+  const paintModule = device.createShaderModule({ code: WGSL_PAINT });
+  const renderModule = device.createShaderModule({ code: WGSL_RENDER });
+
+  interactionPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [interLayout] }),
+    compute: { module: interModule, entryPoint: 'main' },
+  });
+  movementPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [rwLayout] }),
+    compute: { module: moveModule, entryPoint: 'main' },
+  });
+  paintPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [rwLayout] }),
+    compute: { module: paintModule, entryPoint: 'main' },
+  });
+  renderPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: fmt }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // Bind groups
+  function makeBG(layout, entries) {
+    return device.createBindGroup({ layout, entries: entries.map(([b, buf, type]) => ({
+      binding: b, resource: { buffer: buf },
+    }))});
+  }
+  interBG_AtoB = device.createBindGroup({ layout: interLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridA } },
+    { binding: 2, resource: { buffer: tempA } },
+    { binding: 3, resource: { buffer: gridB } },
+    { binding: 4, resource: { buffer: tempB } },
+  ]});
+  interBG_BtoA = device.createBindGroup({ layout: interLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridB } },
+    { binding: 2, resource: { buffer: tempB } },
+    { binding: 3, resource: { buffer: gridA } },
+    { binding: 4, resource: { buffer: tempA } },
+  ]});
+  rwBG_A0 = device.createBindGroup({ layout: rwLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridA } },
+    { binding: 2, resource: { buffer: tempA } },
+  ]});
+  rwBG_A1 = device.createBindGroup({ layout: rwLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer1 } },
+    { binding: 1, resource: { buffer: gridA } },
+    { binding: 2, resource: { buffer: tempA } },
+  ]});
+  rwBG_B0 = device.createBindGroup({ layout: rwLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridB } },
+    { binding: 2, resource: { buffer: tempB } },
+  ]});
+  rwBG_B1 = device.createBindGroup({ layout: rwLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer1 } },
+    { binding: 1, resource: { buffer: gridB } },
+    { binding: 2, resource: { buffer: tempB } },
+  ]});
+  renderBG_A = device.createBindGroup({ layout: renderLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridA } },
+    { binding: 2, resource: { buffer: tempA } },
+  ]});
+  renderBG_B = device.createBindGroup({ layout: renderLayout, entries: [
+    { binding: 0, resource: { buffer: paramsBuffer0 } },
+    { binding: 1, resource: { buffer: gridB } },
+    { binding: 2, resource: { buffer: tempB } },
+  ]});
+
+  document.getElementById('gpu-label').textContent = 'WebGPU: ' + (adapter.info?.device || adapter.info?.description || 'active');
+
+  setupUI();
+  requestAnimationFrame(frame);
+}
+
+// ==================== FRAME LOOP ====================
+function makeParamsData(stepOffset) {
+  const buf = new ArrayBuffer(48);
+  const u = new Uint32Array(buf);
+  const i = new Int32Array(buf);
+  u[0] = W; u[1] = H; u[2] = frameNum; u[3] = stepOffset;
+  i[4] = mouseGX; i[5] = mouseGY;
+  u[6] = mouseDown ? 1 : 0; u[7] = material;
+  i[8] = brushSize; u[9] = paused ? 1 : 0;
+  u[10] = SCALE; u[11] = showTemp ? 1 : 0;
+  return buf;
+}
+
+function frame() {
+  const pp = frameNum & 1; // ping-pong: 0=write to B, 1=write to A
+
+  // 4-step z-pattern: (0,0)=0, (1,0)=1, (0,1)=2, (1,1)=3
+  // Cycle 2 steps per frame, covering all 4 over 2 frames
+  const step0 = (frameNum * 2) % 4;
+  const step1 = (frameNum * 2 + 1) % 4;
+  device.queue.writeBuffer(paramsBuffer0, 0, makeParamsData(step0));
+  device.queue.writeBuffer(paramsBuffer1, 0, makeParamsData(step1));
+
+  const enc = device.createCommandEncoder();
+
+  // Paint pass (on input buffer)
+  if (mouseDown) {
+    const p = enc.beginComputePass();
+    p.setPipeline(paintPipeline);
+    p.setBindGroup(0, pp === 0 ? rwBG_A0 : rwBG_B0);
+    p.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8));
+    p.end();
+  }
+
+  if (!paused) {
+    // Interaction pass (ping-pong)
+    const ip = enc.beginComputePass();
+    ip.setPipeline(interactionPipeline);
+    ip.setBindGroup(0, pp === 0 ? interBG_AtoB : interBG_BtoA);
+    ip.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8));
+    ip.end();
+
+    // Movement pass 1 (Margolus block CA, step from z-pattern)
+    const m1 = enc.beginComputePass();
+    m1.setPipeline(movementPipeline);
+    m1.setBindGroup(0, pp === 0 ? rwBG_B0 : rwBG_A0);
+    m1.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    m1.end();
+
+    // Movement pass 2 (second Margolus step, different offset)
+    const m2 = enc.beginComputePass();
+    m2.setPipeline(movementPipeline);
+    m2.setBindGroup(0, pp === 0 ? rwBG_B1 : rwBG_A1);
+    m2.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16));
+    m2.end();
+  }
+
+  // Render pass (read from output/current buffer)
+  const outputBG = paused ? (pp === 0 ? renderBG_A : renderBG_B) : (pp === 0 ? renderBG_B : renderBG_A);
+  const rp = enc.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      loadOp: 'clear', storeOp: 'store',
+      clearValue: { r: 0.102, g: 0.102, b: 0.180, a: 1.0 },
+    }],
+  });
+  rp.setPipeline(renderPipeline);
+  rp.setBindGroup(0, outputBG);
+  rp.draw(3);
+  rp.end();
+
+  device.queue.submit([enc.finish()]);
+
+  if (!paused) { frameNum++; }
+
+  // FPS
+  fpsCount++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    currentFps = fpsCount;
+    fpsCount = 0;
+    lastFpsTime = now;
+    document.getElementById('fps').textContent = `${currentFps} fps`;
+    document.getElementById('fps').className = currentFps < 30 ? 'warn' : '';
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ==================== CLEAR (CPU upload) ====================
+function clearGrid() {
+  const emptyGrid = new Uint32Array(W * H);
+  const roomTemp = new Float32Array(W * H).fill(22.0);
+  device.queue.writeBuffer(gridA, 0, emptyGrid);
+  device.queue.writeBuffer(gridB, 0, emptyGrid);
+  device.queue.writeBuffer(tempA, 0, roomTemp);
+  device.queue.writeBuffer(tempB, 0, roomTemp);
+}
+
+// ==================== INPUT ====================
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', e => {
+  mouseDown = true;
+  const rect = canvas.getBoundingClientRect();
+  mouseGX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseGY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseGX = ((e.clientX - rect.left) / SCALE) | 0;
+  mouseGY = ((e.clientY - rect.top) / SCALE) | 0;
+});
+canvas.addEventListener('mouseup', () => mouseDown = false);
+canvas.addEventListener('mouseleave', () => mouseDown = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  brushSize = Math.max(1, Math.min(20, brushSize + (e.deltaY > 0 ? -1 : 1)));
+  document.getElementById('brush-label').textContent = `Brush: ${brushSize}`;
+}, { passive: false });
+
+const keyMap = {
+  '1': SAND, '2': WATER, '3': STONE, '4': FIRE, '5': WOOD,
+  '6': OIL, '7': GUNPOWDER, '8': ICE, '9': ACID, '0': EMPTY,
+  'q': LAVA, 'w': METAL, 'e': PLANT, 'r': SALT, 't': SMOKE,
+  'y': GAS, 'u': CLONE, 'i': VOID, 'o': EMBER,
+};
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (keyMap[k] !== undefined) { material = keyMap[k]; updateActiveBtn(); }
+  if (k === 'c' && !e.ctrlKey) clearGrid();
+  if (k === ' ') { e.preventDefault(); paused = !paused; updateModeLabel(); }
+  if (k === 'v') { showTemp = !showTemp; updateModeLabel(); }
+});
+
+function updateActiveBtn() {
+  document.querySelectorAll('.mat-btn').forEach(b => b.classList.remove('active'));
+  const t = document.querySelector(`[data-mat="${material}"]`);
+  if (t) t.classList.add('active');
+}
+function updateModeLabel() {
+  const p = [];
+  if (paused) p.push('PAUSED');
+  if (showTemp) p.push('THERMAL VIEW');
+  document.getElementById('mode-label').textContent = p.join(' · ');
+}
+
+// ==================== UI SETUP ====================
+function setupUI() {
+  const BTN_COLORS = {
+    [SAND]: '#d4b464', [WATER]: '#2850c8', [STONE]: '#787882', [FIRE]: '#ff6420',
+    [WOOD]: '#64411e', [OIL]: '#3c2846', [GUNPOWDER]: '#505050', [STEAM]: '#b4b4dc',
+    [ACID]: '#1edc32', [LAVA]: '#c83c0a', [ICE]: '#b4d6fa', [SMOKE]: '#5a5a5f',
+    [PLANT]: '#1ea028', [SALT]: '#dcdcf0', [METAL]: '#aaafb4',
+    [GAS]: '#8cb420', [CLONE]: '#32c8d2', [VOID]: '#4a0060', [EMBER]: '#ffaa22',
+  };
+  const toolbar = document.getElementById('toolbar');
+  const btnDefs = [
+    [SAND, 'Sand', '1'], [WATER, 'Water', '2'], [STONE, 'Stone', '3'],
+    [ICE, 'Ice', '8'], [SALT, 'Salt', 'R'], [WOOD, 'Wood', '5'],
+    [PLANT, 'Plant', 'E'], null,
+    [OIL, 'Oil', '6'], [GUNPOWDER, 'Pwdr', '7'], [METAL, 'Metal', 'W'],
+    [ACID, 'Acid', '9'], [LAVA, 'Lava', 'Q'], null,
+    [FIRE, 'Fire', '4'], [GAS, 'Gas', 'Y'], [SMOKE, 'Smoke', 'T'],
+    [EMBER, 'Ember', 'O'], null,
+    [CLONE, 'Clone', 'U'], [VOID, 'Void', 'I'], null,
+    [EMPTY, 'Erase', '0'],
+  ];
+  btnDefs.forEach(def => {
+    if (def === null) {
+      const sep = document.createElement('div');
+      sep.className = 'sep';
+      toolbar.appendChild(sep);
+      return;
+    }
+    const [id, name, key] = def;
+    const btn = document.createElement('button');
+    btn.className = 'btn mat-btn' + (id === material ? ' active' : '');
+    btn.dataset.mat = id;
+    btn.innerHTML = `${name}<span class="key">${key}</span>`;
+    if (BTN_COLORS[id]) {
+      btn.style.borderBottomColor = BTN_COLORS[id];
+      btn.style.borderBottomWidth = '3px';
+    }
+    btn.addEventListener('click', () => { material = id; updateActiveBtn(); });
+    toolbar.appendChild(btn);
+  });
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'btn';
+  clearBtn.innerHTML = 'Clear<span class="key">C</span>';
+  clearBtn.style.borderColor = '#833';
+  clearBtn.addEventListener('click', clearGrid);
+  toolbar.appendChild(clearBtn);
+}
+
+// ==================== LAUNCH ====================
+init().catch(err => {
+  console.error(err);
+  document.getElementById('error').style.display = 'block';
+  document.getElementById('error').textContent = 'WebGPU Error: ' + err.message +
+    '. Try Chrome 113+ or Edge 113+. Firefox and Safari have limited support.';
+  canvas.style.display = 'none';
+});
+</script>
+</body>
+</html>
