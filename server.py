@@ -24,7 +24,7 @@ CONDA_PREFIX = Path(os.environ.get(
     os.path.expanduser("~/miniconda3/envs/gvhmr"),
 ))
 VENV_PYTHON = CONDA_PREFIX / "bin" / "python"
-PROCESS_SCRIPT = BASE_DIR / "tools" / "process_video_sam2.py"
+PROCESS_SCRIPT = Path(__file__).resolve().parent / "process_video_sam2.py"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB
