@@ -54,7 +54,7 @@ def sanitize_name(name):
     return name
 
 
-def process_video_thread(video_path, name, max_frames=600):
+def process_video_thread(video_path, name, max_frames=0):
     """Run SAM2 processing in background, parsing stdout for progress."""
     global current_job
 
@@ -227,7 +227,7 @@ def upload_video():
     video_path = video_dir / "source.mp4"
     file.save(str(video_path))
 
-    max_frames = int(request.form.get("max_frames", 600))
+    max_frames = int(request.form.get("max_frames", 0))
 
     # Start processing
     with job_lock:
@@ -262,7 +262,7 @@ def reprocess_video(name):
     if not source.exists():
         return jsonify({"error": "No source video found to reprocess"}), 400
 
-    max_frames = int(request.form.get("max_frames", 600))
+    max_frames = int(request.form.get("max_frames", 0))
 
     with job_lock:
         current_job["name"] = name

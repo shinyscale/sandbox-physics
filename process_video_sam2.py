@@ -27,8 +27,11 @@ import numpy as np
 import torch
 
 
-def extract_frames(video_path, output_dir, max_frames=600):
-    """Extract JPEG frames from a video file."""
+def extract_frames(video_path, output_dir, max_frames=0):
+    """Extract JPEG frames from a video file.
+
+    max_frames=0 means extract all frames (no limit).
+    """
     print("Extracting frames...", flush=True)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -41,8 +44,7 @@ def extract_frames(video_path, output_dir, max_frames=600):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # If video has more frames than max_frames, sample evenly
-    if total_raw > max_frames:
+    if max_frames > 0 and total_raw > max_frames:
         indices = np.linspace(0, total_raw - 1, max_frames, dtype=int)
     else:
         indices = np.arange(total_raw)
@@ -237,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser(description="Process video with SAM2")
     parser.add_argument("video_path", help="Path to input video file")
     parser.add_argument("--name", required=True, help="Output directory name")
-    parser.add_argument("--max-frames", type=int, default=600, help="Max frames to extract")
+    parser.add_argument("--max-frames", type=int, default=0, help="Max frames (0 = all)")
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent.parent
